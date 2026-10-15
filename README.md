@@ -1,19 +1,21 @@
-# Mdwell
+# Vellistry
 
 Ein lokaler Markdown-Leseplatz für eigene Ordner und öffentliche/private GitHub-Repositories: Rust-Core, SQLite FTS5 und Svelte-Oberfläche mit Tauri-2-Integration.
 
-**Status: initiales Entwicklungs-MVP, nicht produktionsgehärtet.** Core, Frontend, asynchroner Tauri-Desktop-Host, Root-Cargo-Workspace und npm-Tauri-CLI sind integriert. Desktop-`cargo check` und Binary-Build sind unter Linux bestanden; ein begrenzter nativer Starttest lief fünf Sekunden ohne Fehlermeldungen. Native Ende-zu-Ende-Interaktion, Release-/Bundle-/Installer-Abläufe und vollständige Cross-OS-Parität sind noch nicht verifiziert.
+**Status: initiales Entwicklungs-MVP, nicht produktionsgehärtet.** Core, Frontend, asynchroner Tauri-Desktop-Host, Root-Cargo-Workspace und npm-Tauri-CLI sind integriert. Linux-Debug-/Release-Builds und automatisierte Tests sind bestanden; Linux-Pakete wurden gebaut. Device Flow, private Repository-Anzeige, authentifiziertes Klonen/Öffnen von `almighty-atlas/notes`, verbesserte Suche und vereinfachtes Onboarding wurden vom Nutzer manuell erfolgreich getestet. Installierte Pakete, vollständige Release-Abläufe und Cross-OS-Parität sind damit nicht verifiziert. Details: [Prüfergebnisse](docs/VALIDATION.md).
 
 ## Funktionen und Grenzen
 
 - Lokale `.md`-/`.markdown`-Dateien lesen, durchsuchen und im CodeMirror-Quellmodus bearbeiten.
-- Öffentliche/private GitHub-Repositories über HTTPS oder SSH importieren und ausdrücklich per Fast-Forward synchronisieren; kein Commit/Push. Die integrierte [GitHub-App-Anmeldung](docs/GITHUB_INTEGRATION.md) nutzt den Systembrowser, PKCE, einen geheimnishaltenden Auth-Broker und native System-Keychains; inklusive Kontoanzeige und Repository-Auswahl. Dafür muss der Betreiber einmalig eine echte GitHub App registrieren, den HTTPS-Broker bereitstellen und die öffentliche Build-Konfiguration setzen. Alternativ bleiben bestehende [HTTPS-Credential-Helper und SSH](docs/AUTHENTICATION.md) unterstützt. Keine Klartext-Tokenablage oder Tokens in URLs; benutzerdefinierte lokale Git-Konfiguration ist absichtlich nicht unterstützt.
+- Öffentliche/private GitHub-Repositories über HTTPS oder SSH importieren und ausdrücklich per Fast-Forward synchronisieren; kein Commit/Push. Die integrierte [Vellistry-GitHub-App-Anmeldung](docs/GITHUB_INTEGRATION.md) nutzt Device Flow im Systembrowser, direkte GitHub-Endpunkte und native System-Keychains; inklusive Kontoanzeige und Auswahl installierter, freigegebener Repositories. Öffentlicher Client `Iv23liS0HYbIuk9WY8B0`, App-Slug `vellistry`: kein Client-Secret, Broker, Docker/Tunnel oder Auth-Build-Konfiguration nötig. Die App muss Device Flow und ablaufende Tokens aktiviert haben; Installation mit **Only select repositories** und ausschließlich lesenden Rechten. Die echte Anmeldung wurde manuell bestätigt; realer Token-Refresh und die vollständige Plattformmatrix bleiben zu prüfen. Alternativ bleiben bestehende [HTTPS-Credential-Helper und SSH](docs/AUTHENTICATION.md) unterstützt. Keine Klartext-Tokenablage oder Tokens in URLs; benutzerdefinierte lokale Git-Konfiguration ist absichtlich nicht unterstützt.
 - GFM inklusive Tabellen und Admonitions, TOC, Code-Highlighting/Copy, History, abschnittsbasierte Suche über alle oder einen ausgewählten Workspace mit Überschriftenhierarchie, exaktem Dateinamen-Rang, Phrasen, implizitem letztem Präfix und begrenzter Mehrwort-Tippfehlerkorrektur. Geschlossenes Frontmatter wird ausgeblendet, bleibt aber samt Originaloffsets in der Quelle erhalten.
 - Speichern mit SHA-256-Revision und Konfliktanzeige; Entwürfe werden nicht still durch Polling ersetzt. Externe Writer können trotzdem den letzten Check/Rename racen; Entwürfe sind nicht crashfest gespeichert.
 - Suchtreffer zeigen Abschnittskontext und markierte Begriffe; Reader-Markierungen bleiben auf passende Blöcke begrenzt. Core-Offsets bezeichnen **Markdown-Blöcke**, keine exakten Teilzeichenfolgen; Source springt weiter zum Blockanfang.
 - Lokale Rasterbilder werden sicher eingebettet: inerte Core-Bildreferenzen werden über workspacegebundene Assets zu Blob-URLs, die beim Cleanup widerrufen werden. Asset-Links öffnen einen Dialog; kein Remote-Bildabruf, kein SVG und kein Mermaid-Rendering. AVIF/BMP-Allowlisten sind noch nicht Ende-zu-Ende konsistent.
 - Vier-Sekunden-Polling ruft lokal Refresh für jeden Workspace vor dessen Dokumentliste auf und aktualisiert damit auch den Suchindex nach externen Änderungen. Nur Änderungen werden neu indexiert; unveränderte Dateien werden trotzdem gelesen/gehasht. Das aktuelle saubere Dokument wird nur bei geänderter indexierter Revision neu gelesen; unveränderte Listen/Dateibäume bleiben gecacht, dirty Entwürfe erhalten. Sync bleibt eine separate, ausdrückliche Netzwerkaktion.
 - Feste Ausschlüsse `.git`, `node_modules`, `target`; keine konfigurierbaren Regeln/`.gitignore`-Auswertung und noch keine Workspace-Entfernung.
+
+Der sichtbare Produktname ist **Vellistry**. Bestehende `mdwell`-Paket-/Executable-Namen, `org.mdwell.desktop`, App-Datenpfade, Preference-Keys und der Keychain-Service `mdwell.github` bleiben aus Kompatibilitätsgründen erhalten; die sichtbare Umbenennung migriert oder löscht keine Nutzerdaten.
 
 ## Voraussetzungen
 
@@ -125,10 +127,13 @@ Der Reader nutzt gecachte Überschriftenpositionen, passives Scrollen mit RAF/Bi
 
 - [Architektur](docs/ARCHITECTURE.md): Technologieentscheidung Tauri/iced/egui, FTS5/Tantivy, Schemas und Sicherheits-/Race-Grenzen.
 - [Design](docs/DESIGN.md): Prioritäten, Interaktionen und aktuelles Verhalten.
-- [GitHub-Kontoverbindung](docs/GITHUB_INTEGRATION.md): GitHub-App-Registrierung, OAuth/PKCE, Auth-Broker, System-Keychains und externe Freigabeschritte.
+- [GitHub-Kontoverbindung](docs/GITHUB_INTEGRATION.md): Vellistry Device Flow, öffentliche Identität/URLs, secretloser Refresh, System-Keychains, Phishing-Grenzen, Linux/Hyprland-Hilfe und vollständige manuelle Integrationstest-Checkliste.
 - [Alternative Authentifizierung](docs/AUTHENTICATION.md): HTTPS-Helper, SSH-Agent/Hostprüfung und absichtliche Konfigurationsgrenzen.
+- [Git-Klondiagnose und Regressionstests](docs/GIT_DIAGNOSTICS.md): reproduzierte Helper-Ursache, sichere Fehlerdiagnose, echte lokale HTTPS-Clone-/Fetch-Tests und GitHub-End-to-End-Abnahme.
+- [Changelog](CHANGELOG.md): gesicherter MVP-Stand und Änderungen.
+- [Prüfergebnisse](docs/VALIDATION.md): tatsächlich ausgeführte Checks, Linux-Pakete und offene manuelle Prüfungen.
 - [Suche](docs/SEARCH.md): Abschnittsindex, Migration, Ranking, Query-Regeln und aktuelle Benchmarks.
 - [Performance](docs/PERFORMANCE.md): Reader-Optimierungen, Verhaltensänderungen und Chromium-/Native-Messgrenzen.
-- [Roadmap](docs/ROADMAP.md): Bildhärtung, Watcher, Workspace-Entfernung und zurückgestellte integrierte OAuth-Anmeldung/Mermaid.
+- [Roadmap](docs/ROADMAP.md): Bildhärtung, Watcher, Workspace-Entfernung, Device-Flow-Integrationsprüfung und zurückgestelltes Mermaid-Rendering.
 
-MIT, © 2026 Mdwell contributors. Siehe [LICENSE](LICENSE).
+MIT, © 2026 Vellistry contributors. Siehe [LICENSE](LICENSE).

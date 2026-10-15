@@ -1,226 +1,169 @@
-# GitHub App integration and auth broker
+# Vellistry GitHub integration: Device Flow
 
-Mdwell's optional GitHub account integration uses a GitHub **App**, browser authorization with state and S256 PKCE, a desktop loopback callback, and a small confidential token broker. The broker holds the App client secret; the desktop never does. Existing Git/SSH agents and HTTPS credential helpers remain alternatives: see [AUTHENTICATION.md](AUTHENTICATION.md) for that separate workflow. This integration does not install or replace those tools.
+Vellistry connects a GitHub **App** using GitHub's OAuth Device Flow. The native desktop talks directly to GitHub; the system browser is used only for the user's approval. No client secret, App private key, broker, Docker container, tunnel, homelab repository, callback listener, custom domain, or per-build auth environment configuration is required. Existing HTTPS credential helpers and SSH remain alternatives: [AUTHENTICATION.md](AUTHENTICATION.md).
 
-## 1. Register the GitHub App (external operator step)
+The user has confirmed live Device Flow, private repository listing, authenticated clone/open of `almighty-atlas/notes`, improved search, and simplified onboarding. See [VALIDATION.md](VALIDATION.md) for the scope and attribution. This is not proof of the full installed-release/platform matrix; the checklist below remains the complete release gate.
 
-In GitHub **Settings → Developer settings → GitHub Apps → New GitHub App**:
+## 1. Public identity and endpoints
 
-1. Choose a real name/homepage and record the resulting **App slug** and **Client ID** (not the numeric App ID). There are deliberately no dummy production IDs in this repository.
-2. Choose one fixed desktop callback port in **1024–65535** (nonzero u16, greater than 1023) for this deployment. **43827 is an illustrative port choice only**, not an automatically selected/default port or a dummy client identifier. Review expected local port conflicts before choosing the real deployment value. Use the same decimal port in the desktop compile-time `MDWELL_GITHUB_CALLBACK_PORT`, broker server environment `GITHUB_CALLBACK_PORT`, and GitHub callback registration. The broker's own listen port (8787 by default) is separate and need not match.
-3. Register exactly `http://127.0.0.1:PORT/callback`, replacing `PORT` with that chosen decimal value. For the illustrative choice only, this is `http://127.0.0.1:43827/callback`. Disable callback wildcard matching. Do not substitute `localhost`, HTTPS, the broker URL, or a portless callback. This exact fixed-port registration follows the [GitHub App callback policy](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/about-the-user-authorization-callback-url) and [user-token flow](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app). The required desktop flow binds **that exact `127.0.0.1` port before opening the browser**, supplies the identical redirect URI to authorization and exchange, and reports an explicit port-busy error instead of falling back to another port. The broker rejects any different callback port and does not rewrite or omit `redirect_uri`.
-4. Disable **Request user authorization (OAuth) during installation**. Automatic installation authorization lacks the desktop-controlled PKCE challenge, state, and chosen callback port. Users install the App, then initiate authorization explicitly from Mdwell. Leave setup URL unset unless separately needed; it is not the authorization callback.
-5. Repository permissions: **Contents: Read-only** and mandatory **Metadata: Read-only** only. No repository write, organization, or account permissions; no additional event subscriptions. Disable **Active** under Webhook; no webhook endpoint/secret is required. No App private key is needed: this broker exchanges user tokens, not JWTs or installation access tokens. Leave device flow disabled for this implementation.
-6. Allow installation on **Any account** (public App) if distributing Mdwell to other users. On the public installation page, choose the intended personal/organization account and **Only select repositories**, not all repositories. Organization approval/SSO may be required. Authorization grants only the intersection of user access and App installation access.
-7. Keep expiring user access tokens enabled. GitHub currently documents access tokens lasting eight hours and refresh tokens six months; rely on returned expiry values, not hardcoded lifetimes. Generate a client secret and provision it **only on the broker host**.
+| Purpose | Fixed public value |
+| --- | --- |
+| Product / GitHub App | Vellistry |
+| Client ID (public, not a password) | `Iv23liS0HYbIuk9WY8B0` |
+| App slug | `vellistry` |
+| App page | <https://github.com/apps/vellistry> |
+| Install / select repositories | <https://github.com/apps/vellistry/installations/new> |
+| Request device authorization (native POST) | `https://github.com/login/device/code` |
+| User verification (system browser) | <https://github.com/login/device> |
+| Poll tokens and refresh (native POST) | `https://github.com/login/oauth/access_token` |
+| Authenticated REST API | `https://api.github.com` |
+| Manage authorizations / installations | <https://github.com/settings/apps> |
 
-## 2. Broker contract and local run
+These values are compiled into the native host. Ordinary development and CI builds need no auth secrets or auth configuration. The former `MDWELL_GITHUB_*` broker/callback build settings are obsolete; remove them from local build environments rather than carrying forward deployment instructions. The Device Flow does not use a redirect URI, loopback OAuth port, PKCE verifier, or callback state. The separate short-lived native Git credential-helper loopback channel is **not** an OAuth callback and remains part of the existing Git architecture.
 
-Requires Python 3.11+ with stdlib only. No pip packages, database, token files, App key, or desktop secret. The only application environment variables are:
+## 2. GitHub App owner settings (external prerequisite)
 
-- `GITHUB_CLIENT_ID`: exact registered GitHub App Client ID.
-- `GITHUB_CLIENT_SECRET`: registered App client secret.
-- `GITHUB_CALLBACK_PORT`: **required**, canonical decimal port in 1024–65535, matching `MDWELL_GITHUB_CALLBACK_PORT` and the registered callback exactly. Missing, invalid, whitespace-padded, or leading-zero values prevent startup; there is no default.
+The App owner must review the actual GitHub settings; this repository does not change them:
 
-Provision these using your process manager's protected environment/secret injection. Never put secrets in source control, command arguments, a desktop build, support tickets, or a shell history. For an interactive local run, use `getpass` prompts (nothing is sent to GitHub until a valid request arrives):
+1. Use the existing **Vellistry** App matching the client ID and slug above, not a new OAuth App or a dummy client. Enable **Device Flow** in its settings.
+2. Keep **expiring user access tokens** enabled. GitHub documents an eight-hour access-token lifetime and six-month refresh-token lifetime; the desktop uses returned expiry values, not those examples as constants. Do not disable expiry to avoid implementing/testing refresh.
+3. Repository permissions: **Contents: Read-only**, plus mandatory **Metadata: Read-only**. No write, organization, or additional account permissions. No event subscriptions are needed. Disable **Active** under Webhook; no webhook URL or webhook secret is required.
+4. Allow installation on **Any account** for public distribution. Disable **Request user authorization (OAuth) during installation** so installation and the explicit desktop Device Flow remain separate. No setup URL is needed for this workflow. Callback fields, if present in GitHub's registration UI, do not participate in Device Flow and must not be treated as a deployment requirement.
+5. Do not generate or distribute a client secret or App private key for this desktop integration. Device authorization, token polling, and refresh use the public client ID without `client_secret`. No operator-hosted token endpoint is involved.
 
-```sh
-python3 -B -c 'import getpass, os, runpy; os.environ["GITHUB_CLIENT_ID"] = input("Real GitHub App Client ID: "); os.environ["GITHUB_CLIENT_SECRET"] = getpass.getpass("App client secret: "); os.environ["GITHUB_CALLBACK_PORT"] = input("Registered desktop callback port (1024-65535): "); runpy.run_path("scripts/github-auth-broker/broker.py", run_name="__main__")'
-```
+Reference: GitHub's [generating a user access token (Device Flow)](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app) and [refreshing user access tokens](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/refreshing-user-access-tokens).
 
-The listener is always `127.0.0.1:8787`; `--port` changes the nonzero port. Local HTTP is **only** for testing or a same-host TLS reverse proxy. Desktop production configuration requires HTTPS. There is no remotely accessible bind option or environment-selectable upstream.
+## 3. Install, authorize, and choose repositories
 
-`POST /token`, `Content-Type: application/json` (optionally `; charset=utf-8`), with exactly one of:
+Installation and user authorization are different grants; either one alone is insufficient for private repository access.
 
-```text
-authorization_code: grant_type, client_id, code, code_verifier, redirect_uri
-refresh_token:     grant_type, client_id, refresh_token
-```
+1. Open <https://github.com/apps/vellistry/installations/new>, select the intended personal or organization account, and choose **Only select repositories**. Select the minimum repositories you want to read, not all repositories.
+2. Organization owners may need to approve the installation, and organization policy/SSO may impose additional requirements. A pending approval is not successful repository access.
+3. In the desktop account settings, start GitHub sign-in. Vellistry requests a device authorization and displays the **user code**, verification URL, and expiry information. The private `device_code` stays native; it is never sent to the WebView.
+4. Open the displayed verification page in your system browser, or manually navigate to **https://github.com/login/device** if the opener fails. Enter only the code from the sign-in you just started in your trusted local Vellistry instance. Confirm the GitHub account and **Vellistry** App before approving.
+5. Leave the desktop sign-in pending while approving. Vellistry polls GitHub, reads the profile, and saves credentials in the native keychain. Closing the browser alone does not cancel polling; use the desktop cancellation action. After expiry/denial, start a fresh sign-in and use the new code.
+6. Verify the connected login, then open the repository picker. It enumerates `/user/installations` and `/user/installations/{id}/repositories`, paginates both, and deduplicates by repository ID. Its list is the intersection of the user's access and the App's installation permissions, not every repository on the account.
+7. Select a repository to clone over HTTPS. Sync is an explicit fetch/fast-forward operation, not a background push, commit, or cloud-sync service. Unselected repositories must remain unavailable even if the user can access them outside Vellistry.
 
-All fields are strings. Exact client ID equality; no unknown or duplicate fields. Authorization verifier is RFC 7636 unreserved ASCII, 43–128 characters (desktop generates 43). Redirect must be exactly `http://127.0.0.1:<GITHUB_CALLBACK_PORT>/callback`, without credentials, query, fragment, or leading-zero port; other otherwise-valid ports are also rejected. Codes/refresh tokens are 1–2048 printable non-space ASCII characters; control characters are rejected. Body limit is 8192 bytes. Content-Length is required; duplicate lengths, transfer encoding, and content encoding are rejected. Connections are closed after a response.
+To add/remove repository access later, manage the relevant installation in GitHub settings (personal or organization), then reload the repository list. An empty list can mean no installation, no selected repositories, insufficient user access, pending approval, or organization policy; repeated sign-in does not grant missing installation permissions.
 
-The broker sends a fixed, certificate-verified HTTPS POST to `https://github.com/login/oauth/access_token`, URL-encoded form body, `Accept: application/json`. It injects the secret server-side. **Authorization-code exchange omits `grant_type`**, as required by GitHub's web flow; refresh sends `grant_type=refresh_token`. It never follows redirects, honors environment HTTP proxies, retries exchanges, or echoes upstream error bodies/details. Success is filtered to `access_token`, `token_type`, optional `refresh_token`, `expires_in`, `refresh_token_expires_in`; upstream OAuth rejection maps to a generic 401, other upstream problems to generic 502. All HTTP responses carry `Cache-Control: no-store`. There are no CORS headers and no browser preflight support. CORS is not an authentication mechanism.
+## 4. Native protocol, polling, and token lifecycle
 
-Socket timeouts are 10 seconds; request-body and upstream-body reading also have deadlines. Upstream response limit is 16384 bytes. These are **not a universal end-to-end deadline**: OS DNS resolution and stdlib header parsing can exceed socket deadlines (e.g. slow-drip headers). The reverse proxy, process resource limits, and bounded workers are required in production. The desktop itself has a 15-second broker-request timeout; slow exchanges can finish after the desktop has stopped waiting.
+All authorization forms go directly to the fixed GitHub HTTPS endpoints:
 
-## 3. Same-host TLS deployment (systemd + nginx)
+- Device request: `client_id`.
+- Token poll: `client_id`, private `device_code`, and `grant_type=urn:ietf:params:oauth:grant-type:device_code`.
+- Refresh: `client_id`, `refresh_token`, and `grant_type=refresh_token`. **No client secret**, including for refresh.
 
-These instructions target a Linux host with Python 3.11+, systemd, nginx, a real domain pointing at it, and an already provisioned trusted TLS certificate. Obtain/renew certificates using your normal ACME tooling; certificate issuance is an external deployment step, not something the broker performs. Substitute your **real domain and certificate paths** in the nginx template; do not ship the explanatory placeholders.
+The native host validates the response and accepts only the exact verification URI `https://github.com/login/device`. It waits the server's interval before the first and subsequent polls, continues on `authorization_pending`, increases the interval by at least five seconds on `slow_down`, and backs off transient transport/server failures within the device deadline. Denied, expired, invalid, or malformed grants stop with sanitized errors. Cancellation stops pending work and prevents a late success from reconnecting a disconnected account. A request already in flight may finish; cancellation is not server-side revocation.
 
-From the checkout, install only the runtime script:
+Before an authenticated operation, access tokens expiring within 60 seconds are refreshed under a credential lock. Refresh tokens rotate: save the replacement access token, refresh token, and expiry metadata in the native store before continuing. An expired/revoked refresh token requires a fresh Device Flow. An ambiguous refresh network failure or failed storage after rotation may mean GitHub consumed the old refresh token; the implementation deletes stale credentials or blocks their reuse until cleanup succeeds. Do not retry a possibly consumed refresh token or restore an old token backup as recovery. Unlock the keychain, disconnect if required, and sign in again.
 
-```sh
-sudo install -d -m 0755 /opt/mdwell-github-auth-broker
-sudo install -m 0644 scripts/github-auth-broker/broker.py /opt/mdwell-github-auth-broker/broker.py
-sudo install -m 0600 /dev/null /etc/mdwell-github-auth-broker.env
-sudoedit /etc/mdwell-github-auth-broker.env
-```
+Account status, cached avatars, and synchronized files can be shown offline. **Connected** means locally saved authorization, not a live GitHub validity check. Listing repositories, cloning, syncing, and refreshing need network access. Local reading/searching must not depend on GitHub or refresh succeeding. Optional avatar failures do not block sign-in; only bounded, validated raster avatars from the approved GitHub avatar host are cached and displayed as local data URLs.
 
-In that root-owned file, enter `GITHUB_CLIENT_ID=`, `GITHUB_CLIENT_SECRET=`, and `GITHUB_CALLBACK_PORT=` with the real values (systemd EnvironmentFile syntax, not `export`). The callback port must match the GitHub registration and desktop build; the App secret must never be included in the desktop environment. Use a secret manager instead if available. Keep the file root-readable only. Create `/etc/systemd/system/mdwell-github-auth-broker.service`:
+## 5. Native storage and persistent compatibility
 
-```ini
-[Unit]
-Description=Mdwell GitHub App auth broker
-After=network-online.target
-Wants=network-online.target
+- macOS: Keychain. Windows: native credential store. Linux: encrypted Secret Service D-Bus access to an **existing, unlocked default collection**.
+- The persistent service remains **`mdwell.github`**, with account/username **`Iv23liS0HYbIuk9WY8B0`** (the client ID). Linux matches the existing keyring-v3 attributes `service=mdwell.github`, `username=<client ID>`, `target=default`. Preserve these identities so existing credentials remain discoverable after the visible rename.
+- Vellistry is the visible product name; legacy `mdwell` Cargo/package/executable names, `org.mdwell.desktop` application identity, app-data paths, SQLite/workspace caches, and frontend preference keys are compatibility identifiers, not auth configuration. Do not rename/delete them as part of login troubleshooting. See [architecture](ARCHITECTURE.md).
+- Tokens and refresh metadata stay in the native credential store, not SQLite, plaintext JSON files, browser storage, repository URLs, command arguments, or ordinary child-process environment variables. A serialized credential payload inside the encrypted keychain is not a plaintext-file fallback.
+- Linux never creates/unlocks a collection, runs a Secret Service prompt, or falls back to a session-only collection. Locked/unavailable storage fails with guidance to unlock externally. D-Bus method calls have two-second timeouts; connection setup bounds the caller's wait to three seconds with at most one unfinished connection worker.
 
-[Service]
-Type=simple
-DynamicUser=yes
-EnvironmentFile=/etc/mdwell-github-auth-broker.env
-ExecStart=/usr/bin/python3 -B /opt/mdwell-github-auth-broker/broker.py --port 8787
-Restart=on-failure
-RestartSec=5
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=strict
-ProtectHome=yes
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-LimitCORE=0
-TasksMax=32
-MemoryMax=128M
+**Disconnect is local:** it deletes this client's saved credentials, not the GitHub authorization, App installation, or cached repository content. For server-side revocation use GitHub **Settings → Applications → Authorized GitHub Apps → Vellistry → Revoke**; optionally uninstall under **Installed GitHub Apps** / organization installation settings. Revocation can affect other desktop instances sharing the authorization. Remove cached files separately if needed; revocation cannot erase already cloned content. No webhook is needed for correctness: subsequent online operations surface authorization failure. A connected native account takes precedence over external HTTPS helpers; auth errors do not silently switch identities. Disconnect to intentionally use the existing helper path again. SSH remains independent.
 
-[Install]
-WantedBy=multi-user.target
-```
+## 6. Phishing and trust boundaries
 
-This assumes `/usr/bin/python3` is your suitable interpreter. Disable swap or use encrypted swap on the host; memory is sensitive. Start and inspect without printing credentials:
+A public client ID identifies the App, **not a genuine Vellistry binary**. There is no embedded desktop shared secret. An attacker can initiate Device Flow for the same public client and ask a victim to approve the attacker's code on the real GitHub site. Seeing `github.com` and the correct App name alone does not prove that the code came from your desktop.
 
-```sh
-sudo systemctl daemon-reload
-sudo systemctl enable --now mdwell-github-auth-broker
-sudo systemctl status --no-pager mdwell-github-auth-broker
-```
+- Start sign-in yourself in a trusted local build/installed app. Approve only its freshly displayed code. Never enter a code received through chat, email, support, an issue, a QR advertisement, or someone else's screen, even at the legitimate GitHub verification page.
+- Check the exact HTTPS hostname `github.com`, the account, App identity, and requested permissions. If unexpected, deny/cancel and investigate. Never send user codes, device codes, tokens, keychain dumps, or approval screenshots to support.
+- Device Flow is not callback PKCE/state; it does not provide those interception protections or binary attestation. Short expiry, careful code provenance, minimal installation access, and user review matter. A compromised browser, desktop, keychain, privileged local process, or malicious app build remains outside the protection offered by this flow.
+- Only safe display fields cross IPC. Auth responses/errors are bounded and sanitized; raw token bodies and Git/helper stderr must not be logged. Do not enable HTTP body tracing, process dumps, or debug telemetry containing credentials. TLS verification stays enabled and authorization redirects are not followed.
+- GitHub receives authorization/API requests directly; no Vellistry-operated broker or Cloudflare tunnel processes tokens. This removes that intermediary, not GitHub's or the local machine's trust boundary. External Git helpers/SSH configuration remain executable user policy as described in [AUTHENTICATION.md](AUTHENTICATION.md).
 
-Place this template in an nginx config included **inside `http {}`** (e.g. an enabled site). `YOUR_REAL_DOMAIN` and the certificate paths below are mandatory operator substitutions, not runnable production defaults:
+## 7. Linux / Hyprland troubleshooting
 
-```nginx
-limit_req_zone $binary_remote_addr zone=mdwell_auth_ip:10m rate=12r/m;
-limit_conn_zone $binary_remote_addr zone=mdwell_auth_connections:10m;
-# Deliberately excludes URI/query, IP, headers, bodies, tokens and upstream details.
-log_format mdwell_auth_safe '$status $request_time';
+Run Vellistry as the logged-in graphical user, not root, a system service, or inside a new `dbus-run-session` disconnected from the desktop. Keyring access and browser opening are separate dependencies.
 
-server {
-    listen 443 ssl;
-    server_name YOUR_REAL_DOMAIN;
-    ssl_certificate /PATH/TO/REAL/fullchain.pem;
-    ssl_certificate_key /PATH/TO/REAL/privkey.pem;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    client_max_body_size 8k;
-    client_header_timeout 10s;
-    client_body_timeout 10s;
-    send_timeout 10s;
-    access_log /var/log/nginx/mdwell-auth-status.log mdwell_auth_safe;
-    # Raw proxy error messages can include attacker-controlled request URIs.
-    error_log /dev/null;
-    add_header Cache-Control no-store always;
+### Keyring unavailable, locked, or requires a prompt
 
-    location = /token {
-        limit_req zone=mdwell_auth_ip burst=20 nodelay;
-        limit_req_status 429;
-        limit_conn mdwell_auth_connections 4;
-        limit_conn_status 429;
-        proxy_pass http://127.0.0.1:8787;
-        proxy_http_version 1.1;
-        proxy_request_buffering on;
-        proxy_connect_timeout 2s;
-        proxy_send_timeout 10s;
-        proxy_read_timeout 12s;
-        proxy_set_header Host localhost;
-        proxy_set_header Connection close;
-        proxy_set_header X-Forwarded-For "";
-        proxy_set_header Forwarded "";
-        proxy_set_header X-Real-IP "";
-        proxy_hide_header Cache-Control;
-    }
-    location / { return 404; }
-}
-```
-
-Do not add a plaintext redirect listener for token POSTs. Expose only TLS port 443 to clients, keep 8787 inaccessible outside the host, and allow broker outbound DNS and TCP 443 to GitHub. The proxy must share the host/network namespace for this loopback setup. Validate and reload:
+On Arch/CachyOS, one option is:
 
 ```sh
-sudo nginx -t
-sudo systemctl reload nginx
+sudo pacman -S --needed gnome-keyring seahorse
+busctl --user status org.freedesktop.secrets
 ```
 
-Use an existing dedicated/default-deny virtual-host configuration so unknown Host/SNI values do not unexpectedly route to the broker. nginx body/header timeout settings are inactivity limits, not absolute request-duration limits; add edge slow-client/DDoS protection for a public service.
+Use a single Secret Service provider. A KWallet installation works only if its version/configuration actually exposes `org.freedesktop.secrets`; having KWallet installed is not proof. Inspect service status, not secret contents.
 
-**IP trust and capacity:** the Python broker always limits the TCP peer, never `Forwarded`, `X-Forwarded-For`, or `X-Real-IP`. Its aggregate token bucket allows a burst of 200 and replenishes 120/minute per peer; behind this proxy all users share the loopback bucket. nginx separately limits each direct client IP to a burst of 20 and 12/minute, so one edge client cannot consume the entire aggregate budget at its allowed rate. Multiple attacking clients can still exhaust shared capacity: size and load-test these limits for the deployment, with reviewed tuning of `RateLimit` defaults and edge abuse protection. If nginx is itself behind a CDN/load balancer, configure nginx real-IP handling **only for explicitly allowlisted trusted proxy CIDRs**, block direct bypass, and ensure that upstream overwrites attacker-provided forwarding headers. Do not enable unconditional forwarded-IP trust. For multiple broker replicas, enforce shared edge limits; per-process buckets are not distributed limits.
-
-Python caps concurrent accepted workers at 16, bounds its peer table to 4096 entries, and closes excess connections without spawning workers. Saturation can therefore produce a connection error instead of HTTP 429. Reverse-proxy limits are part of deployment, not optional decorations. Monitor sanitized status/latency counts, 401/429/502 trends, connection resets, process restarts, memory/CPU, DNS/TLS failures, and certificate expiry. Keep log retention limited. Never enable debug/request-body logging or APM token/header capture. Alerting/load testing and host hardening remain operator responsibilities. Secret rotation: provision the new secret, restart the broker, verify authorization/refresh, then retire the previous secret in GitHub; no desktop change is required if the Client ID is unchanged.
-
-## 4. Desktop build configuration
-
-Set these **compile-time** variables to real public configuration before building Rust/Tauri:
-
-- `MDWELL_GITHUB_CLIENT_ID`: exactly the broker's GitHub App Client ID.
-- `MDWELL_GITHUB_BROKER_URL`: HTTPS **base URL**, without credentials/query/fragment. The desktop appends `/token`; use `https://your-real-broker-domain`, **not** `https://your-real-broker-domain/token`. A base path such as `/github` needs an explicit proxy route mapping `/github/token` to broker `/token`; the nginx template above supports the root base only.
-- `MDWELL_GITHUB_APP_SLUG`: real public App slug used for installation.
-- `MDWELL_GITHUB_CALLBACK_PORT`: **required**, fixed decimal port in **1024–65535**; exactly the value in broker `GITHUB_CALLBACK_PORT` and the GitHub registration. There is no random-port fallback. Changing it requires coordinated registration, broker configuration/restart, and desktop rebuild/distribution; retain a matching registration/deployment for older supported builds or retire them explicitly.
-
-Prompt for real values rather than building with examples:
+Prefer distro-supported PAM/session integration to start and unlock the login keyring. If activation is absent, start once **inside the existing graphical D-Bus session**:
 
 ```sh
-read -r -p 'GitHub App Client ID: ' MDWELL_GITHUB_CLIENT_ID
-read -r -p 'HTTPS broker base URL: ' MDWELL_GITHUB_BROKER_URL
-read -r -p 'GitHub App slug: ' MDWELL_GITHUB_APP_SLUG
-read -r -p 'Registered desktop callback port (1024-65535): ' MDWELL_GITHUB_CALLBACK_PORT
-export MDWELL_GITHUB_CLIENT_ID MDWELL_GITHUB_BROKER_URL MDWELL_GITHUB_APP_SLUG MDWELL_GITHUB_CALLBACK_PORT
-npm ci
-npm run tauri -- build
+gnome-keyring-daemon --start --components=secrets
 ```
 
-The prompt commands require Bash. Client ID, broker URL, slug, and callback port are public, not authentication secrets. Do not set `GITHUB_CLIENT_SECRET` in desktop CI. Configure release CI with real public values and verify that a changed compile-time configuration triggers a fresh Rust build. Missing variables disable this integration with configuration guidance, rather than selecting a demo App. Release signing/distribution and installed-artifact validation are external steps.
+Hyprland can use `exec-once = gnome-keyring-daemon --start --components=secrets` when PAM/service activation is not already doing this. Do not start competing daemons. Use Seahorse (or the provider's supported UI) to create/select a default persistent login collection and unlock it **outside Vellistry**, then retry. Autologin often cannot unlock an encrypted keyring; password/PAM synchronization depends on the actual login manager. Never remove keyring encryption, dump credentials, or create a plaintext token file to bypass this error. Verify persistence after logout and reboot.
 
-## 5. Native credentials, offline use, and revocation
+### Browser does not open
 
-The desktop uses the OS-native keyring with service **`mdwell.github`** and account **the Client ID**. Linux uses synchronous, encrypted Secret Service D-Bus access with prompts disabled; macOS uses Keychain and Windows uses the native credential store. Linux requires an existing, unlocked default collection and fails with external-unlock guidance rather than creating a collection or waiting for an unlock prompt. D-Bus methods use two-second timeouts; connection setup has a three-second caller wait and at most one unfinished connection worker. No plaintext fallback is allowed. A locked/unavailable store is an actionable error; do not work around it with a token file.
-
-On CachyOS/Arch with Hyprland, install a Secret Service provider such as `gnome-keyring` plus an unlock UI such as `seahorse` (`sudo pacman -S gnome-keyring seahorse`), or a KWallet version configured to expose **the Secret Service API**. KWallet being installed alone is not proof that this API works. The graphical user session needs a working D-Bus session bus and a reachable `org.freedesktop.secrets` service. Run Mdwell as the logged-in graphical user, not root or a system service. For diagnostics, run `busctl --user status org.freedesktop.secrets` in the same session; do not dump secret contents.
-
-Prefer distro-supported PAM/session integration to start/unlock the login keyring. If not activated automatically, start `gnome-keyring-daemon --start --components=secrets` **inside the existing graphical D-Bus session**, once, and unlock/create the default login keyring interactively in Seahorse. Hyprland can use `exec-once = gnome-keyring-daemon --start --components=secrets` when PAM/service activation is absent. Do not start competing providers or a separate D-Bus session for Mdwell. Autologin often cannot unlock an encrypted keyring automatically; unlock it interactively. Login-keyring and login-password synchronization/PAM details depend on the actual display/login manager, not Hyprland alone. Verify read/write/delete in the built app and persistence after logout/reboot before release.
-
-Account status, saved avatars, and previously synchronized workspace content can be shown offline (the repository picker itself requires an online API request); “connected” reflects locally stored authorization, not live GitHub validity. Refresh requires the network, broker, and unlocked keyring. An expired/revoked refresh token requires signing in again. Refresh tokens rotate: if the broker exchanges one but the reply is lost, or the desktop crashes/fails keyring storage before saving the replacement, the old token may no longer work. The broker deliberately cannot recover that rotation; reauthorization is the safe recovery. Do not automatically retry a possibly consumed refresh/code exchange.
-
-**Disconnect is local:** it deletes this App's stored credentials, not GitHub authorization/installation or cached workspace content. For server-side revocation, use GitHub **Settings → Applications → Authorized GitHub Apps → revoke**, and optionally uninstall under **Installed GitHub Apps** / the organization installation settings. Remove local caches/workspaces separately if desired. Revocation also affects other desktop instances using that authorization. No webhook is needed for correctness: subsequent API/refresh failures surface rejection.
-
-## 6. Security boundary
-
-The broker is trusted with the App secret **and** transient user authorization codes, verifiers, access tokens, and refresh tokens. TLS protects transport but does not hide these from the broker operator, compromised host, memory dumps, or instrumentation. It is stateless: tokens are not persisted, logged, or cached, and GitHub calls receive only the allowlisted fields. Python cannot promise reliable in-memory secret zeroization; disable core dumps and unneeded tracing.
-
-The fixed-port local callback must bind before browser launch and validate PKCE/state. Once the desktop owns the listener, a second process cannot win the pre-launch callback-listener race. A local process can occupy the configured port first and deny sign-in; the desktop must fail with a clear port-busy error without opening the browser, switching ports, or exposing credentials. Release testing must verify this ordering and the busy-port failure. PKCE/state protect the authorization flow against callback interception/forgery; these protections do not defend against a compromised desktop or other privileged local attacker.
-
-The endpoint is public. A client ID is public and **does not authenticate the Mdwell binary**; there is no meaningful embedded desktop shared secret. PKCE/state protect the user authorization path, not broker capacity or all endpoint abuse. Rate/concurrency limits, bounded parsing, fixed upstream, trusted deployment, monitoring, and rotation are required. Do not mistake no-CORS for protection against non-browser attackers. A malicious party can exercise the App's token endpoint through this broker with their own valid grants; GitHub still enforces user/App installation permissions.
-
-## 7. Test matrix and release gates
-
-Run the offline checks from the repository root:
+The browser may not share the desktop's environment when launched from a terminal, launcher, or user service. From the same graphical session, test a harmless URL:
 
 ```sh
+xdg-settings get default-web-browser
+xdg-open https://github.com/login/device
+systemctl --user status xdg-desktop-portal.service xdg-desktop-portal-hyprland.service
+```
+
+Ensure a default browser and `xdg-utils` are installed. On Hyprland, use the distro-supported `xdg-desktop-portal` / `xdg-desktop-portal-hyprland` setup and appropriate desktop environment propagation for the user service manager. Do not blindly restart session services or introduce a second D-Bus session. An absent portal service is diagnostic context, not proof of the cause: `xdg-open` can also use a browser directly. If manual opening works, navigate to the exact verification URL and enter your own current desktop code; no callback handler or local port needs repair. Cancel/restart if the code expires while troubleshooting.
+
+For network errors, check DNS, proxy, system time, and trusted CA configuration for GitHub. Do not disable TLS verification. For a successful login with no repositories, review installation selection, organization approval/SSO, and account identity before changing the keyring.
+
+## 8. Automated checks and full manual integration checklist
+
+See [the migration validation report](VALIDATION.md) for commands actually run, observed results, generated Linux packages, and outstanding manual gates. [Native Git diagnosis](GIT_DIAGNOSTICS.md) explains the reproduced credential capability/configuration bugs, real smart HTTPS regressions, safe error classification, and simplified repository onboarding.
+
+From the repository root, with Rust/npm dependencies and native build prerequisites already available:
+
+```sh
+cargo fmt --all --check
 cargo test --workspace --offline
 cargo clippy --workspace --all-targets --offline -- -D warnings
 npm run check
 npm test
-python3 -B -m unittest discover -s scripts/github-auth-broker -v
-npm run tauri -- build --no-bundle -- --offline
+npm run build
+cargo build -p mdwell-desktop --offline
+cargo build -p mdwell-desktop --release --offline
+python3 scripts/test-git-http.py
+python3 scripts/test-git-helper.py target/debug/mdwell-desktop target/release/mdwell-desktop
 ```
 
-Rust dependencies must already be cached for `--offline`. The final command builds the Linux desktop release binary, not installers. Desktop unit tests exercise PKCE/state and loopback callbacks, denial/cancellation/timeouts, token-exchange and storage failures, native-store error classification, cancellation during credential writes, refresh rotation/expiry/serialization, bounded avatars, and paginated private repository discovery. Core fixtures exercise the real credential-helper protocol and clone/fetch orchestration against local mocks, preserve SSH/HTTPS-helper paths, and read synchronized content offline. Svelte tests mock IPC for account lifecycle and private repository filtering/selection. These are not live GitHub or real OS keychain integration tests.
+`--offline` requires cached Rust dependencies. These commands need no client secret, broker, Docker, tunnel, or real GitHub authorization. Native tests use mock stores and local HTTP fixtures for Device Flow forms, response validation, pending/slow-down/transient retries, deadlines, cancellation races, refresh rotation/storage failures, avatar validation, and paginated repository discovery. Core fixtures cover the real Git credential-helper protocol and Git orchestration; frontend tests mock IPC. They are not evidence of live GitHub settings, real OS keychains, browser integration, signing, or installer behavior. There is no remaining Python broker test job.
 
-The tests use only local loopback mock servers and patched HTTPS connections; no real GitHub request, DNS lookup, client secret, or native keyring is involved.
+### Manual release gates — not yet verified by this document
 
-| Check | Coverage / required verification |
-| --- | --- |
-| Code grant / PKCE | Local mock verifies form encoding, secret injection, exact verifier/redirect, **no grant_type** upstream, filtered response. Desktop end-to-end state/PKCE remains a release check. |
-| Refresh | Local mock verifies exact refresh form/whitelist. GitHub rotation/expiry and crash recovery require real-account validation. |
-| Input / HTTP | Local tests cover wrong client, unknown/duplicate fields, malformed JSON/UTF-8, verifier bounds/alphabet, code controls/size, redirect host/scheme/port/path/query/fragment/credentials, body cap, media type, length ambiguity, unsupported method/path, no-store/no CORS. |
-| Upstream safety | Local tests cover redacted OAuth/HTTP/invalid/oversized responses, no redirect follow, fixed host/timeouts, allowlisted output, silent logs. Real trusted TLS and DNS need deployment verification. |
-| Resource safety | Local tests cover body timeout, simulated upstream timeout, spoofed forwarding headers, bucket refill/table cap and concurrency saturation. Public edge slow-client/load/DDoS testing remains external. |
-| Callback registration / fixed port | Local broker tests verify exact configured-port matching, rejection of other ports, 1024/65535 bounds, and startup failure for missing/invalid configuration. Release checks: real GitHub authorization/exchange with the registered fixed port, desktop binds before browser, explicit busy-port error with no browser launch/random fallback, and state/PKCE rejection. |
-| App installation | Real public personal + organization installs with selected repositories; verify private/public listing/content and denied unselected repositories, SSO/approval. |
-| Native storage | Test installed builds on macOS, Windows and Linux/Hyprland: unlocked, locked, unavailable, logout/reboot, store failure, disconnect. No plaintext fallback. |
-| Lifecycle | Real expiry/refresh, revoked/expired tokens, offline cached use, interrupted exchange, rotation-before-persist crash, reconnect, local disconnect versus GitHub revoke. |
-| Release deployment | Real IDs, signed installed build, HTTPS chain/hostname, proxy routing, body/rate limits, no secret in bundle/logs, service restart/secret rotation, alerts/certificate renewal. |
+The user-confirmed happy path is recorded in [VALIDATION.md](VALIDATION.md#user-confirmed-manual-mvp-validation). Unchecked items below denote the complete release scenarios, not a claim that no manual MVP testing has occurred.
 
-Passing the local broker suite is not evidence that the real GitHub fixed-port authorization flow has run, that the installed desktop binds before browser launch or handles port conflicts correctly, that nginx/systemd have been deployed, that a keyring session is correctly configured, or that an installed release has passed the external matrix. Do not advertise those checks as completed until they have actually run.
+Use a dedicated test account and disposable selected repositories; never attach credentials to the results. Record OS/session, build/commit, installed versus development launch, steps, observed outcome, and pass/fail/not-run. Repeat relevant gates on Linux (including Hyprland), macOS, and Windows with a real installed build.
+
+- [ ] **App configuration:** confirm public identity/client ID, enabled Device Flow, expiring tokens, read-only Contents/Metadata, inactive webhook, public installation policy, and no auth secret/config injected into build or runtime.
+- [ ] **Clean install/build:** launch without former broker environment variables or services. Verify the app does not contact a former custom auth domain, bind an OAuth callback port, or depend on Docker/tunnels. Inspect distribution/config/logs for secrets without printing token data.
+- [ ] **Personal installation:** install on one account with **Only select repositories**, including a disposable private and public repository. Keep a second private repository unselected as a negative control.
+- [ ] **Organization installation:** exercise owner approval, pending/denied approval, selected repositories, SSO/policy restrictions, and a user lacking repository access. Confirm the intersection of user and installation access.
+- [ ] **Happy-path Device Flow:** initiate locally, verify code/URL/expiry are visible, open the system browser, confirm the correct GitHub account and Vellistry App, approve, and observe a saved connected profile. No token/device code should appear in the UI, logs, URLs, or clipboard operations intended for the user code.
+- [ ] **Browser failure/manual route:** simulate unavailable opener/default browser; manually use the exact verification page with the current locally initiated code, and complete sign-in without a callback. Test launcher and terminal starts on Hyprland.
+- [ ] **Denial and expiry:** deny in GitHub; separately let a code expire. Observe actionable terminal state, no newly saved credentials, and successful fresh-code retry. Closing only the browser must not imply cancellation.
+- [ ] **Cancellation/races:** cancel during pending polling, retry promptly, and disconnect while approval/credential saving is in flight. A late response must not resurrect the account or overwrite newer credentials; double initiation must not create concurrent sign-ins.
+- [ ] **Polling/network:** exercise a temporary outage and recovery within the device deadline; verify bounded backoff, no rapid polling, and stop at expiry/cancellation. Confirm `slow_down` timing in controlled fixtures if it cannot safely be induced live; do not load-test GitHub.
+- [ ] **Picker:** verify selected private/public repositories, multiple installations/pages, stable deduplication, search/selection, empty installation/list, and an unavailable repository. Add/remove installation selections and reload. Unselected repositories must not become accessible by manually entering their URL.
+- [ ] **Clone/read/sync:** import the selected private repository over HTTPS, read/search it, make an upstream commit, and explicitly fast-forward sync. Confirm dirty local work is protected and no push/write capability is used. Repository URLs/config must contain no tokens.
+- [ ] **Native persistence:** on each OS, sign in, close/reopen, log out/in, and reboot; login/cache should persist using the existing `mdwell.github` identity. Confirm existing app-data/workspaces/preferences remain discoverable under legacy compatibility IDs.
+- [ ] **Locked/unavailable storage:** lock the keyring, stop/unavailable-provider test safely, and exercise read/save/delete failures. Linux must fail promptly with external-unlock guidance, not prompt/create a collection or fall back to plaintext/session-only storage. Unlock externally and recover; failed disconnect must not be reported as successful deletion.
+- [ ] **Real expiry/refresh:** allow access-token expiry (or use an isolated controlled test harness without editing production credentials), perform an authenticated operation, and verify direct secretless refresh plus persisted rotation. Restart and verify the replacement credentials work. Do not disable expiring tokens to pass this gate.
+- [ ] **Refresh failure:** test expired/revoked refresh authorization and interrupted refresh/failed persistence in controlled fixtures. No reuse of a possibly consumed token, silent helper identity fallback, or infinite retry. Cleanup/disconnect then fresh Device Flow must recover.
+- [ ] **Offline:** after successful sync, disconnect the network and restart; cached login/avatar/files/search remain usable. Picker/sync/refresh fail clearly without deleting local content or falsely claiming online validity.
+- [ ] **Disconnect/revoke/uninstall:** local disconnect removes credentials but preserves cloned content and GitHub authorization/installation. Reconnect, revoke on GitHub, and confirm the next online operation fails safely; uninstall or remove repository selection and verify access is lost. Account for other desktop instances and still-cached files.
+- [ ] **Alternative auth regression:** with native account disconnected, verify existing HTTPS helper; verify SSH agent/strict host-key behavior independently. With native account connected but rejected, ensure HTTPS does not silently switch to the helper account.
+- [ ] **Phishing review:** unexpected or externally supplied codes are rejected by the tester; exact domain/App/account and local code provenance are explained. Testers understand that correct client ID/App name is not binary attestation.
+- [ ] **Installed-release UX/security:** verify focus, accessible code/expiry/errors/cancel controls, browser launch, keychain permissions, upgrade/cache compatibility, and absence of token leakage on all target platforms. Signing/notarization/bundle/installer validation remains separate from an unsigned CI build.
+
+Only mark a gate passed after observing it. A local test suite or successful build does not prove a real GitHub Device Flow, secretless refresh, native keyring, or installed desktop workflow has run.

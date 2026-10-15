@@ -2,7 +2,7 @@
 
 ## Produktidee und Prioritäten
 
-Mdwell ist ein ruhiger, lokaler Leseplatz für Markdown aus eigenen Ordnern und öffentlichen/privaten GitHub-Repositories. Das initiale Entwicklungs-MVP priorisiert:
+Vellistry ist ein ruhiger, lokaler Leseplatz für Markdown aus eigenen Ordnern und öffentlichen/privaten GitHub-Repositories. Das initiale Entwicklungs-MVP priorisiert:
 
 1. **Daten erhalten:** Quelldateien bleiben maßgeblich; explizites Speichern mit Revision, Entwurfsschutz und verständliche Konflikte vor automatischer Bequemlichkeit.
 2. **Gut lesen:** begrenzte Zeilenlänge, klare Typografie, Inhaltsverzeichnis, Code-Highlighting und wenig visuelle Ablenkung.
@@ -39,7 +39,7 @@ Lokale Markdown-Bilder werden jetzt eingebettet: der Core liefert inerte Bildref
 
 ## Authentifizierung und Reader-Performance
 
-Private Repositories sind über vorhandene vertrauenswürdige System-/Global-Credential-Helper (GitHub CLI/GCM) oder SSH-Konfiguration mit Agent und strikt geprüften `known_hosts` implementiert. Login/Schlüsselladen/Hostprüfung erfolgen vorher außerhalb Mdwell. Diese alternativen Wege bleiben neben der integrierten [GitHub-App-Anmeldung mit PKCE, Auth-Broker und System-Keychain](GITHUB_INTEGRATION.md) bestehen. Kein Klartext-Credential-Speicher oder Token in URLs; benutzerdefinierte lokale Git-Konfiguration wird absichtlich abgelehnt. Einrichtung und Grenzen: [Authentifizierung](AUTHENTICATION.md).
+Private Repositories sind über vorhandene vertrauenswürdige System-/Global-Credential-Helper (GitHub CLI/GCM) oder SSH-Konfiguration mit Agent und strikt geprüften `known_hosts` implementiert. Login/Schlüsselladen/Hostprüfung erfolgen vorher außerhalb Vellistry. Diese alternativen Wege bleiben neben der integrierten [Vellistry-GitHub-App-Anmeldung mit Device Flow, direktem secretlosem Refresh und System-Keychain](GITHUB_INTEGRATION.md) bestehen. Kein Klartext-Credential-Speicher oder Token in URLs; benutzerdefinierte lokale Git-Konfiguration wird absichtlich abgelehnt. Einrichtung und Grenzen: [Authentifizierung](AUTHENTICATION.md).
 
 Überschriftenpositionen werden gecacht; passives Scrollen bündelt Auswahl per RAF/Binärsuche ohne laufende DOM-Geometriemessung. Resize, Bilder, Fonts und Leseeinstellungen invalidieren den Cache. Sichere PNG/GIF/JPEG-Header reservieren bekannte Bildgrößen; späte/andere Bilder können weiterhin Layout verschieben. Highlighting startet verzögert und pausiert beim Scrollen: nur bekannte explizite Sprachen; unbekannte/unmarkierte oder über 16.000 Zeichen bzw. 400 Zeilen große Blöcke bleiben **bewusst Klartext**. Copy nutzt weiterhin den Originaltext.
 
@@ -50,7 +50,7 @@ Das sind gezielte Arbeitsreduktionen, kein Reader-/Editor-Redesign. [Performance
 - Bild-Allowlisten vereinheitlichen, Inhaltsvalidierung und Decoder-Grenzen prüfen; die begrenzte workspacegebundene Auflösung ohne stille Netzwerkzugriffe beibehalten.
 - Watcher mit Debounce, Rescan und Fehleranzeige evaluieren, um die wiederholten I/O-Kosten der derzeitigen Polling-Scans zu reduzieren.
 - Workspace-Entfernung klar von Datei-/Checkout-Löschung unterscheiden; nie lokale Originale implizit löschen.
-- Integrierte OAuth-Anmeldung/Abmeldung bleibt zurückgestellt; bestehende Systemauthentifizierung beibehalten, ohne Secrets in URLs, SQLite, Logs oder WebView-Speicher.
+- Integrierten Device Flow und lokale Abmeldung nativ Ende-zu-Ende prüfen, einschließlich Keyring/Browser, Ablauf/Refresh, Phishing-Hinweisen und ausgewählter Installations-Repositories. Bestehende Systemauthentifizierung beibehalten, ohne Secrets in URLs, SQLite, Logs oder WebView-Speicher.
 - Messbare Performance und Accessibility vor zusätzlichen Diagramm-, Plugin- oder Sync-Funktionen. Keine RAM-/Geschwindigkeitsversprechen ohne dokumentierte Baseline.
 
 Details zu Schemas, Suche, Dateisystem-Races und Sicherheitsgrenzen: [Architektur](ARCHITECTURE.md). Geplante Arbeit: [Roadmap](ROADMAP.md).

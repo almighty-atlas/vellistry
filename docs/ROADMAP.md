@@ -5,7 +5,7 @@ Status: initiales Entwicklungs-MVP, nicht produktionsgehärtet. Die Liste trennt
 ## Implementiert
 
 - [x] Unabhängiger Rust-Core für lokale Ordner und öffentliche/private GitHub-Repositories über HTTPS/SSH.
-- [x] Systemauthentifizierung: vertrauenswürdige System-/Global-Helper (GitHub CLI/GCM) oder bestehende SSH-Konfiguration, Agent und strikte `known_hosts`-Prüfung. Zusätzlich integrierte [GitHub-App-Anmeldung](GITHUB_INTEGRATION.md) mit PKCE, Browser, Auth-Broker, System-Keychain und Repository-Auswahl (externe Registrierung/Bereitstellung und reale Ende-zu-Ende-Prüfung erforderlich). Kein Klartext-Credential-Speicher oder Token-URL; benutzerdefinierte lokale Git-Konfiguration absichtlich nicht unterstützt. [Einrichtung und Grenzen](AUTHENTICATION.md).
+- [x] Systemauthentifizierung: vertrauenswürdige System-/Global-Helper (GitHub CLI/GCM) oder bestehende SSH-Konfiguration, Agent und strikte `known_hosts`-Prüfung. Zusätzlich integrierte [GitHub-App-Anmeldung](GITHUB_INTEGRATION.md) mit Device Flow, Systembrowser, direktem secretlosem Refresh, System-Keychain und Repository-Auswahl (App-Einstellungen, Installation mit ausgewählten Repositories und reale Ende-zu-Ende-Prüfung erforderlich; kein Broker/Tunnel oder Auth-Build-Konfiguration). Kein Klartext-Credential-Speicher oder Token-URL; benutzerdefinierte lokale Git-Konfiguration absichtlich nicht unterstützt. [Einrichtung und Grenzen](AUTHENTICATION.md).
 - [x] SQLite-Metadaten/FTS5, SHA-256-basierter inkrementeller Abschnittsindex mit Überschriftenhierarchie; exakter Dateinamen-Rang, Überschriften-/Titelstärke, BM25, Phrasen, implizites letztes Präfix und begrenzte unabhängige Mehrwort-Tippfehlerkorrektur. [Query-Grenzen und Messungen](SEARCH.md).
 - [x] Transaktionale Offline-Migration des Suchschemas auf v1 aus Legacy-Caches, Revisionserhalt, Rebuild-Marker, Rollback und Ablehnung neuerer Versionen; kein allgemeines App-Migrationssystem.
 - [x] Suchkontext/-markierungen mit `section_title`, `source_end`, `matched_terms`, blockbegrenzten Textwalks, Unicode-/Präfixabbildung, History und erhaltenen Links/Copy/Find-Layern; Source-Offsets bleiben Blockoffsets.
@@ -20,14 +20,17 @@ Status: initiales Entwicklungs-MVP, nicht produktionsgehärtet. Die Liste trennt
 - [x] Begrenzte lokale Raster-Asset-API, Anzeige verlinkter Assets und eingebettete lokale Markdown-Bilder über inerte Referenzen und Blob-URLs mit Cleanup-/Race-Tests.
 - [x] Tauri-2-Host mit asynchronen Commands/`spawn_blocking`, App-Datenverzeichnis, restriktiver CSP und Hauptfenster-Capability; Desktop-`cargo check` und Binary-Build unter Linux bestanden.
 - [x] Root-Cargo-Workspace mit `default-members = ["crates/core"]` und installierte npm-Tauri-CLI.
-- [x] Aktueller Linux-Prüfstand: `cargo fmt --all --check`, `cargo test --workspace --all-targets`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo build -p mdwell-desktop`, npm-Check, 71 Frontendtests, Frontend-Build und Audit (0 Schwachstellen) bestanden. Separater Core-Lauf: 32 Tests plus ein Doc-Test. Editor-Chunk-Warnung bleibt bestehen.
+- [x] Aktueller automatisierter Prüfstand: Workspace-Formatting/-Tests, Clippy mit allen Targets und `-D warnings`, Desktop-Debug-/Release-Build, npm-Check, 110 Frontendtests, Frontend-Build, reale lokale HTTPS-Fixture und 14 Helper-Checks je Executable bestanden. Siehe [VALIDATION.md](VALIDATION.md); Editor-Chunk-Warnung bleibt bestehen.
+- [x] Vom Nutzer manuell bestätigt: Device Flow, private Repository-Anzeige, authentifiziertes Klonen/Öffnen von `almighty-atlas/notes`, verbesserte Suche und vereinfachtes Onboarding.
 - [x] Windows-Pfadkomponenten-Normalisierung korrigiert; portable Git-Konfigurationsisolation mit vertrauenswürdiger System-/Global-Allowlist und leerem Hooks-Verzeichnis ersetzt Unix-Spezialpfade. Windows-Runtime noch nicht getestet.
 - [x] Direkter nativer Linux-Starttest: Prozess blieb fünf Sekunden ohne Fehlermeldungen aktiv und wurde danach beendet. Ein erster Xvfb-Harness-Lauf hatte ein Timeout-/Cleanup-Problem, keinen nachgewiesenen App-Fehler.
 - [x] Core-/Git-Fixture-Tests, gemockte Frontend-/IPC-Tests und synthetisches Release-Benchmark-Beispiel.
 
 ## Unmittelbare Validierung und Medien
 
-- [ ] Native Interaktion, echte authentifizierte GitHub-Verbindungen und Ende-zu-Ende-Abläufe auf echten Desktop-Plattformen vollständig prüfen; bisherige Auth-Tests laufen offline mit lokalen Fixtures/Dummy-Helpern/Mock-SSH. Linux-Check, Binary-Build und begrenzter Starttest sind bestanden; Release-Builds, Tauri-Bundles und Installer sind noch nicht getestet.
+- [ ] Vollständige [Device-Flow-Integrationstest-Checkliste](GITHUB_INTEGRATION.md#8-automated-checks-and-full-manual-integration-checklist) auf echten installierten Builds durchführen: persönliche/Organisations-Installationen mit nur ausgewählten Read-only-Repositories, Browser/Keyring einschließlich Hyprland, Phishing-Grenzen, Cancellation, Ablauf/secretloser Refresh/Rotation, Offline, lokale Abmeldung versus GitHub-Widerruf und Helper-/SSH-Regressionen.
+
+- [ ] Über den bestätigten GitHub-MVP-Happy-Path hinaus native Ende-zu-Ende-Abläufe auf allen Desktop-Plattformen prüfen. Automatisierte Auth-Tests laufen mit lokalen Fixtures/Mock-Stores. Linux-Release-Build und Tauri-Bundles wurden gebaut; Installation, Upgrades und vollständige Plattformmatrix bleiben offen.
 - [ ] CI für Core-Tests/Formatting, Frontend-Checks/Tests/Build und Desktop-Check/Build auf Linux, macOS und Windows erfolgreich durchlaufen lassen. Keine Signing-Secrets voraussetzen.
 
 - [ ] Raster-Allowlisten zwischen Core und Frontend vereinheitlichen; Inhaltsvalidierung und Decoder-Grenzen prüfen. Remote-Bilder/SVG nicht nebenbei freischalten.
@@ -46,7 +49,6 @@ Status: initiales Entwicklungs-MVP, nicht produktionsgehärtet. Die Liste trennt
 
 ## Später / bewusst zurückgestellt
 
-- [ ] Integrierte OAuth-Anmeldung samt Scopes, Widerruf/Abmeldung und sicherer OS-Credential-Übergabe evaluieren; ausdrücklich zurückgestellt. Private Repositories mit vorhandenen HTTPS-Helpern/SSH-Agent sind bereits implementiert.
 - [ ] Embeddings/semantische Suche höchstens nach nachgewiesenem Bedarf evaluieren; nicht implementiert oder zugesagt.
 - [ ] Mermaid-Rendering erst nach isoliertem Rendering-/Sanitization-Konzept und Ressourcenlimits; derzeit normale Codeblöcke.
 - [ ] Signierte/notarisierte Releases, Installer-/Upgrade-Tests und Release-Prozess. Der normale CI-Build benötigt keine Secrets und liefert keine signierten Releases.

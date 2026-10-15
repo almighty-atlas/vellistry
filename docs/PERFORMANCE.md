@@ -133,4 +133,4 @@ Chromium is not the Linux Tauri GTK/WebKit WebView. Do not extrapolate browser t
 
 ## Related documentation
 
-See [GitHub authentication](AUTHENTICATION.md) for accepted HTTPS/SSH repository URLs, verified SSH host keys, and Git credential-helper setup. Repository URL drafts are not persisted, and mdwell does not store tokens.
+See [GitHub authentication](AUTHENTICATION.md) for accepted HTTPS/SSH repository URLs, verified SSH host keys, and Git credential-helper setup. Repository URL drafts are not persisted. Vellistry's integrated [GitHub Device Flow](GITHUB_INTEGRATION.md) stores tokens only in the native credential store, never in WebView preferences or plaintext files. Existing `mdwell` benchmark paths remain unchanged.
