@@ -1,0 +1,27 @@
+pub const DOCS: &[(&str, &str)] = &[
+    ("README.md", "# Project overview\n\nWelcome to the documentation.\n\n## Getting started\n\nRead the setup instructions."),
+    ("oauth.md", "# Authentication\n\n## OAuth OIDC\n\nOAuth authorization with OIDC identity tokens.\n\n### Refresh tokens\n\nRotate credentials safely."),
+    ("compose.md", "# Containers\n\n## Docker Compose\n\nDocker Compose starts services with compose.yaml."),
+    ("actions.md", "# Automation\n\n## GitHub Actions CI/CD\n\nGitHub Actions runs continuous integration and deployment."),
+    ("german.md", "# Betrieb\n\n## Zugriffsschlüsselverwaltung\n\nZugriffsschlüsselverwaltung schützt Geräte.\n\n## Überprüfung\n\nEine regelmäßige Überprüfung ist nötig."),
+    ("inline.md", "# Lunar operations\n\nThe lunar **module** is ready."),
+    ("noise.md", "# Unrelated notes\n\nREADME README README README README README README README. Docker Compose OAuth OIDC GitHub Actions are mentioned incidentally."),
+    ("sections.md", "# Reference\n\n## Installation\n\nInstall the package.\n\n## Troubleshooting\n\nRepair the broken service."),
+];
+pub const QUERIES: &[(&str, &str)] = &[
+    ("README", "README.md"),
+    ("readme.md", "README.md"),
+    ("\"readme\"", "README.md"),
+    ("OAuth OIDC", "oauth.md"),
+    ("oauth oid", "oauth.md"),
+    ("oatuh odic", "oauth.md"),
+    ("Docker Compose", "compose.md"),
+    ("doker compsoe", "compose.md"),
+    ("GitHub Actions", "actions.md"),
+    ("CI/CD", "actions.md"),
+    ("Zugriffsschlüssel", "german.md"),
+    ("uberprufung", "german.md"),
+    ("\"lunar module\"", "inline.md"),
+    ("troubleshoot", "sections.md"),
+    ("OAuth refresh", "oauth.md"),
+];

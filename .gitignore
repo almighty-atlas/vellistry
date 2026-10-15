@@ -1,0 +1,28 @@
+# JavaScript dependencies and generated frontend output
+node_modules/
+dist/
+
+# Rust build output, including the standalone core during integration
+/target/
+/crates/core/target/
+/src-tauri/target/
+
+# Local test/tool environments and coverage
+.venv*/
+coverage/
+*.tsbuildinfo
+*.log
+
+# Local secrets; examples remain versionable
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# OS/editor-local files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Commit Cargo.lock and package-lock.json for reproducible application builds.
