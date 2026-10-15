@@ -3,7 +3,7 @@
   import { openUrl } from '@tauri-apps/plugin-opener';
   import { api } from './api';
   import { errorMessage } from './helpers';
-  import type { GithubRepository, GithubStatus, Workspace } from './types';
+  import type { DeviceAuthorization, GithubRepository, GithubStatus, Workspace } from './types';
 
   let { picker = false, onadded }: { picker?: boolean; onadded?: (workspace: Workspace) => void | Promise<void> } = $props();
   let status = $state<GithubStatus | null>(null);
@@ -12,28 +12,53 @@
   let visibility = $state('all');
   let loading = $state(true);
   let connecting = $state(false);
+  let device = $state<DeviceAuthorization | null>(null);
   let cancelling = $state(false);
   let working = $state(false);
   let loadingRepositories = $state(false);
   let repositoriesLoaded = $state(false);
   let error = $state('');
   let notice = $state('');
+  let cleanupRequired = $state(false);
+  let selected = $state<GithubRepository | null>(null);
+  let retryRepo = $state<GithubRepository | null>(null);
+  let refreshOnReturn = false;
   let alive = true;
   let generation = 0;
-  const disabled = $derived(loading || connecting || working);
+  let cancelledRequest: number | null = null;
+  const cleanupFailurePrefix = 'GitHub sign-in cancelled, but secure credential cleanup failed.';
+  const disabled = $derived(loading || connecting || cancelling || working || loadingRepositories);
   const filtered = $derived(repositories.filter(repo => repo.full_name.toLowerCase().includes(query.trim().toLowerCase()) && (visibility === 'all' || repo.private === (visibility === 'private'))));
   // Rust downloads and validates avatars; the webview never requests remote images.
   const avatar = $derived(status?.avatar_url && /^data:image\/(png|jpeg|gif|webp);base64,/i.test(status.avatar_url) ? status.avatar_url : null);
 
   onMount(() => {
     void loadStatus();
+    const focus = () => {
+      if (!alive || !refreshOnReturn || !picker || !status?.connected || loadingRepositories) return;
+      refreshOnReturn = false;
+      void loadRepositories();
+    };
+    const visible = () => { if (document.visibilityState === 'visible') focus(); };
+    window.addEventListener('focus', focus);
+    document.addEventListener('visibilitychange', visible);
+    let unlisten: (() => void) | undefined;
+    void import('@tauri-apps/api/window').then(async ({ getCurrentWindow }) => {
+      const stop = await getCurrentWindow().onFocusChanged?.(event => { if (event.payload) focus(); });
+      if (!alive) stop?.(); else unlisten = stop;
+    }).catch(() => {});
     return () => {
-      alive = false; generation++;
+      alive = false; generation++; refreshOnReturn = false;
+      window.removeEventListener('focus', focus);
+      document.removeEventListener('visibilitychange', visible);
+      unlisten?.();
       if (connecting) void api.githubCancel().catch(() => {});
     };
   });
 
   async function loadRepositories() {
+    if (!alive || loadingRepositories) return;
+    refreshOnReturn = false;
     const request = generation;
     loadingRepositories = true; repositoriesLoaded = false; error = '';
     try {
@@ -43,69 +68,97 @@
     finally { if (alive && request === generation) loadingRepositories = false; }
   }
   async function loadStatus() {
+    const request = generation;
     loading = true; error = '';
     try {
       const result = await api.githubStatus();
-      if (!alive) return;
+      if (!alive || request !== generation) return;
       status = result;
       if (result.connected && picker) await loadRepositories();
-    } catch (e) { if (alive) error = errorMessage(e); }
-    finally { if (alive) loading = false; }
+    } catch (e) { if (alive && request === generation) error = errorMessage(e); }
+    finally { if (alive && request === generation) loading = false; }
   }
   async function connect() {
     if (disabled || !status?.configured) return;
     const request = ++generation;
-    connecting = true; error = ''; notice = '';
+    cancelledRequest = null; cleanupRequired = false;
+    connecting = true; device = null; error = ''; notice = '';
     try {
-      // This command stays pending until the native browser callback completes.
-      const result = await api.githubConnect();
+      // The invoke stays pending while Rust polls; the channel delivers the public user code.
+      const result = await api.githubConnect(authorization => {
+        if (alive && request === generation && connecting) device = authorization;
+      });
       if (!alive || request !== generation) return;
-      status = result; connecting = false;
+      status = result; connecting = false; device = null;
       if (result.connected && picker) await loadRepositories();
-    } catch (e) { if (alive && request === generation) error = errorMessage(e); }
-    finally { if (alive && request === generation) connecting = false; }
+    } catch (e) {
+      const message = errorMessage(e);
+      const cleanupFailed = message.startsWith(cleanupFailurePrefix);
+      // Cancellation invalidates ordinary results, but rollback failures still need user action.
+      if (alive && (request === generation || (request === cancelledRequest && cleanupFailed))) {
+        error = message;
+        if (cleanupFailed) { cleanupRequired = true; notice = ''; }
+      }
+    }
+    finally { if (alive && request === generation) { connecting = false; device = null; } }
   }
   async function cancel() {
-    if (cancelling) return;
-    ++generation; cancelling = true; error = '';
+    if (!connecting || cancelling) return;
+    cancelledRequest ??= generation;
+    const request = ++generation;
+    cancelling = true; device = null; error = ''; notice = '';
     try {
       await api.githubCancel();
-      if (alive) { connecting = false; loadingRepositories = false; notice = 'Connection cancelled.'; }
-    } catch (e) { if (alive) error = errorMessage(e); }
-    finally { if (alive) cancelling = false; }
+      if (alive && request === generation) {
+        connecting = false; loadingRepositories = false;
+        if (!cleanupRequired) notice = 'Connection cancelled.';
+      }
+    } catch (e) { if (alive && request === generation) error = errorMessage(e); }
+    finally { if (alive && request === generation) cancelling = false; }
   }
   async function disconnect() {
     if (disabled) return;
+    ++generation; cancelledRequest = null; refreshOnReturn = false;
     working = true; error = ''; notice = '';
     try {
       await api.githubDisconnect();
       if (!alive) return;
-      ++generation;
+      cleanupRequired = false;
       status = status && { ...status, connected: false, login: null, avatar_url: null };
-      repositories = []; query = ''; repositoriesLoaded = false; loadingRepositories = false;
+      repositories = []; query = ''; repositoriesLoaded = false; loadingRepositories = false; retryRepo = null;
       notice = 'GitHub disconnected. Existing local workspaces are unchanged.';
     } catch (e) { if (alive) error = errorMessage(e); }
     finally { if (alive) working = false; }
   }
   async function manage() {
     if (disabled) return;
-    working = true; error = '';
-    try { await api.githubManage(); if (alive) notice = 'Repository access opened in your browser. Refresh repositories after making changes.'; }
-    catch (e) { if (alive) error = errorMessage(e); }
+    working = true; error = ''; notice = '';
+    refreshOnReturn = true;
+    try { await api.githubManage(); if (alive && refreshOnReturn) notice = 'Repository-Zugriff im Browser geöffnet. Bei der Rückkehr wird die Liste aktualisiert; alternativ manuell aktualisieren.'; }
+    catch (e) { if (alive) { refreshOnReturn = false; error = errorMessage(e); } }
     finally { if (alive) working = false; }
   }
   async function add(repo: GithubRepository) {
     if (disabled) return;
-    working = true; error = ''; notice = 'Cloning repository…';
+    selected = repo; retryRepo = null;
+    working = true; error = ''; notice = 'Repository wird geklont und indexiert…';
     try {
-      const workspace = await api.addGithub(repo.clone_url);
+      const workspace = await api.addGithub(repo.clone_url, true);
       if (alive) { notice = `Added ${workspace.name}`; await onadded?.(workspace); }
-    } catch (e) { if (alive) { error = errorMessage(e); notice = ''; } }
-    finally { if (alive) working = false; }
+    } catch (e) { if (alive) { error = errorMessage(e); notice = ''; retryRepo = repo; } }
+    finally { if (alive) { working = false; selected = null; } }
   }
-  async function setupGuide() {
-    try { await openUrl('https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app'); }
-    catch (e) { if (alive) error = errorMessage(e); }
+  async function deviceAction(action: 'copy' | 'open') {
+    if (!connecting || cancelling || !device) return;
+    const request = generation;
+    error = ''; notice = '';
+    try {
+      if (action === 'copy') await navigator.clipboard.writeText(device.user_code);
+      else await openUrl('https://github.com/login/device');
+      if (alive && request === generation && connecting && action === 'copy') notice = 'Code copied.';
+    } catch (e) {
+      if (alive && request === generation && connecting) error = errorMessage(e);
+    }
   }
 </script>
 
@@ -115,16 +168,29 @@
     <div><strong>GitHub</strong><p class="muted">{loading ? 'Checking account…' : status?.connected ? `Connected${status.login ? ` as ${status.login}` : ''}` : 'Not connected'}</p></div>
   </div>
   {#if status && !status.configured}
-    <p role="note">GitHub account sign-in is not configured in this build. Ask the app maintainer to configure the native GitHub App and browser callback, then restart mdwell. You can still add a repository by URL using your existing Git credentials.</p>
-    <button onclick={setupGuide}>GitHub App setup documentation ↗</button>
+    <p role="note">GitHub sign-in is unavailable in this build of Vellistry. You can still add a repository by URL using your existing Git credentials.</p>
   {/if}
   {#if connecting}
-    <p role="status">Waiting for GitHub authorization in your browser…</p>
-    <button onclick={cancel} disabled={cancelling}>{cancelling ? 'Cancelling…' : 'Cancel connection'}</button>
+    <section class="device-authorization" aria-labelledby="github-device-heading" aria-describedby="github-device-hint">
+      <h3 id="github-device-heading">Vellistry mit GitHub verbinden</h3>
+      {#if device}
+        <p>Gib diesen Code auf GitHub ein:</p>
+        <p class="device-code" aria-label="GitHub Gerätecode"><code>{device.user_code}</code></p>
+        <div class="account-actions">
+          <button onclick={() => deviceAction('copy')} disabled={cancelling}>Code kopieren</button>
+          <button onclick={() => deviceAction('open')} disabled={cancelling}>GitHub öffnen</button>
+        </div>
+        <p>Der Code ist {device.expires_in} Sekunden gültig. Vellistry prüft die Freigabe automatisch.</p>
+      {/if}
+      <p id="github-device-hint">Offizielle GitHub-Seite: https://github.com/login/device. Prüfe die Adresse im Browser und gib nur den hier angezeigten Code ein. Teile den Code nicht mit anderen und verwende keine fremden Codes (Phishing).</p>
+      <progress aria-label="GitHub authorization"></progress>
+      <p role="status">{cancelling ? 'Cancelling…' : device ? 'Waiting for GitHub authorization…' : 'Requesting GitHub device code…'}</p>
+      <button onclick={cancel} disabled={cancelling}>Abbrechen</button>
+    </section>
   {:else if status?.connected}
-    <div class="account-actions"><button onclick={manage} disabled={disabled}>Manage repositories ↗</button><button onclick={disconnect} disabled={disabled}>Disconnect GitHub</button></div>
+    <div class="account-actions"><button class="muted" onclick={manage} disabled={disabled}>Repository-Zugriff verwalten ↗</button><button onclick={disconnect} disabled={disabled}>Disconnect GitHub</button></div>
   {:else if status}
-    <button class="primary" onclick={connect} disabled={disabled || !status.configured}>Connect GitHub</button>
+    <button class="primary" onclick={connect} disabled={disabled || !status.configured}>Mit GitHub verbinden</button>
   {/if}
   {#if !status && !loading}<button onclick={loadStatus}>Retry account status</button>{/if}
   {#if picker && status?.connected}
@@ -133,13 +199,24 @@
       <input aria-label="Search repositories" placeholder="Search repositories…" bind:value={query} />
       <select aria-label="Repository visibility" bind:value={visibility}><option value="all">Public and private</option><option value="public">Public</option><option value="private">Private</option></select>
       {#if loadingRepositories}<p role="status">Loading repositories…</p>
-      {:else if repositoriesLoaded && !repositories.length}<p>No repositories available. Install the GitHub App for your account or organization using Manage repositories, select the repositories Mdwell may read, then refresh. Organization approval or an active SSO session may be required.</p>
-      {:else if repositoriesLoaded && !filtered.length}<p>No matching repositories.</p>{/if}
-      <ul>{#each filtered as repo (repo.id)}<li><button aria-label={`${repo.full_name} ${repo.private ? 'Private' : 'Public'}`} onclick={() => add(repo)} disabled={disabled}><span>{repo.full_name}</span><small>{repo.private ? 'Private' : 'Public'}</small></button></li>{/each}</ul>
+      {:else if repositoriesLoaded && !error && !repositories.length}
+              <section class="repository-setup" aria-labelledby="repository-setup-heading">
+                <h3 id="repository-setup-heading">Repository-Zugriff einrichten</h3>
+                <p>Dein GitHub-Konto ist verbunden. Der Zugriff auf Repositories wird separat über die GitHub App freigegeben.</p>
+                <p>Falls die App noch nicht installiert ist, installiere sie für dein Konto oder deine Organisation. Falls sie bereits installiert ist, wähle die Repositories aus, die Vellistry lesen darf. Eine Organisationsfreigabe oder eine aktive SSO-Sitzung kann erforderlich sein.</p>
+                <button class="primary" onclick={manage} disabled={disabled}>Repository-Zugriff einrichten ↗</button>
+                <p class="muted">Nach der Rückkehr wird die Liste automatisch aktualisiert. Du kannst sie auch manuell aktualisieren.</p>
+              </section>
+      {:else if repositoriesLoaded && !error && repositories.length > 0 && !filtered.length}<p>No matching repositories.</p>{/if}
+      <ul>{#each filtered as repo (repo.id)}<li><button aria-label={`${repo.full_name} ${repo.private ? 'Private' : 'Public'}`} onclick={() => add(repo)} disabled={disabled}><span>{repo.full_name}{#if selected?.id === repo.id}<span class="muted"> · Klonen und Indexieren…</span>{/if}</span><small>{repo.private ? 'Private' : 'Public'}</small></button></li>{/each}</ul>
     </div>
   {/if}
   {#if error}<p role="alert" class="error-text">{error}</p>{/if}
-  {#if notice}<p role="status">{notice}</p>{/if}
+  {#if retryRepo}<button onclick={() => retryRepo && add(retryRepo)} disabled={disabled}>{retryRepo.full_name} erneut versuchen</button>{/if}
+  {#if cleanupRequired && !status?.connected}
+    <button onclick={disconnect} disabled={disabled}>Disconnect GitHub and clean up credentials</button>
+  {/if}
+  {#if notice}<p role="status" class="muted">{notice}</p>{/if}
 </section>
 
 <style>
@@ -148,6 +225,10 @@
   .account-heading img { border-radius: 50%; }
   p { line-height: 1.6; }
   .account-heading p { margin: 4px 0; }
+  .device-authorization { margin-top: 16px; padding: 16px; border: 1px solid var(--line); border-radius: 8px; }
+  .device-code { font-size: 24px; font-weight: 700; letter-spacing: .12em; overflow-wrap: anywhere; user-select: all; }
+  .repository-setup { margin-top: 14px; padding: 16px; border: 1px solid var(--line); border-radius: 8px; }
+  .repository-setup h3 { margin-top: 0; }
   .repositories { margin-top: 18px; }
   .repositories input { width: 100%; margin: 10px 0; }
   ul { list-style: none; padding: 0; max-height: 230px; overflow: auto; }

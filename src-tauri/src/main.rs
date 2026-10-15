@@ -2,7 +2,7 @@
 
 mod github;
 
-use github::{AccountStatus, Github, Repository};
+use github::{AccountStatus, DeviceAuthorization, Github, Repository};
 use mdwell_core::{
     Asset, Core, Document, DocumentSummary, ErrorCode, ErrorInfo, RefreshReport, ResolvedLink,
     SearchHit, Workspace,
@@ -41,17 +41,24 @@ async fn add_github(
     core: State<'_, Shared>,
     github: State<'_, Arc<Github>>,
     url: String,
+    native_account: Option<bool>,
 ) -> Result<Workspace, ErrorInfo> {
     let account = github.inner().clone();
     task(core.inner().clone(), move |c| {
         let token = if url.starts_with("https://github.com/") {
             account
-                .access_token()
+                .token_for_repository(&url)
                 .map_err(mdwell_core::Error::Git)?
                 .map(Zeroizing::new)
         } else {
             None
         };
+        if native_account.unwrap_or(false) && token.is_none() {
+            return Err(mdwell_core::Error::Git(
+                "No GitHub account is connected. Reconnect GitHub before adding this repository."
+                    .into(),
+            ));
+        }
         c.add_github_with_token(&url, token.as_deref().map(String::as_str))
     })
     .await
@@ -64,20 +71,22 @@ async fn sync_workspace(
 ) -> Result<RefreshReport, ErrorInfo> {
     let account = github.inner().clone();
     task(core.inner().clone(), move |c| {
-        let https = c.list_workspaces()?.iter().any(|w| {
-            w.id == workspace_id
-                && w.url
-                    .as_deref()
-                    .is_some_and(|url| url.starts_with("https://github.com/"))
-        });
-        let token = if https {
-            account
-                .access_token()
-                .map_err(mdwell_core::Error::Git)?
-                .map(Zeroizing::new)
-        } else {
-            None
-        };
+        let url = c
+            .list_workspaces()?
+            .into_iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .and_then(|workspace| workspace.url)
+            .filter(|url| url.starts_with("https://github.com/"));
+        let token = url
+            .as_deref()
+            .map(|url| {
+                account
+                    .token_for_repository(url)
+                    .map_err(mdwell_core::Error::Git)
+            })
+            .transpose()?
+            .flatten()
+            .map(Zeroizing::new);
         c.sync_workspace_with_token(workspace_id, token.as_deref().map(String::as_str))
     })
     .await
@@ -176,14 +185,14 @@ async fn github_status(github: State<'_, Arc<Github>>) -> Result<AccountStatus, 
 }
 #[tauri::command]
 async fn github_connect(
-    app: tauri::AppHandle,
+    on_device: tauri::ipc::Channel<DeviceAuthorization>,
     github: State<'_, Arc<Github>>,
 ) -> Result<AccountStatus, String> {
     account_task(github.inner().clone(), move |account| {
-        account.start(|url| {
-            app.opener()
-                .open_url(url, None::<&str>)
-                .map_err(|_| "Cannot open system browser.".to_string())
+        account.start(|authorization| {
+            on_device
+                .send(authorization)
+                .map_err(|_| "Cannot display GitHub authorization.".to_string())
         })
     })
     .await
@@ -226,6 +235,14 @@ fn main() {
             app.manage(Arc::new(Github::new()));
             Ok(())
         })
+        .on_window_event(|window, event| {
+            if matches!(
+                event,
+                tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+            ) {
+                let _ = window.state::<Arc<Github>>().cancel();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             github_status,
             github_connect,
@@ -246,5 +263,5 @@ fn main() {
             read_asset
         ])
         .run(tauri::generate_context!())
-        .expect("Failed to run Mdwell desktop");
+        .expect("Failed to run Vellistry desktop");
 }

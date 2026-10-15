@@ -1,22 +1,13 @@
-//! Blocking native GitHub App authentication. Call network methods on spawn_blocking.
-//! The caller opens the supplied authorization URL with the system browser; never a webview.
-//! Register exactly http://127.0.0.1:PORT/callback with the GitHub App, where PORT is
-//! the required compile-time MDWELL_GITHUB_CALLBACK_PORT. No dynamic-port fallback is used.
-//! The HTTPS broker must keep the app secret server-side, enforce the configured client ID
-//! and loopback redirect policy, and never log codes, verifiers, or tokens.
+//! Blocking GitHub App device authentication. Call network methods on spawn_blocking.
+//! Notify the UI with the public user code, then poll here; device codes and tokens never
+//! leave this module except for the access token used by native git operations.
 
-use base64::{
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-    Engine,
-};
-use rand::{rngs::OsRng, RngCore};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::{blocking::Client, redirect::Policy, Url};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    io::{Read, Write},
-    net::{TcpListener, TcpStream},
+    io::Read,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex, MutexGuard,
@@ -24,10 +15,12 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
-const CALLBACK_TIMEOUT: Duration = Duration::from_secs(180);
+const CLIENT_ID: &str = "Iv23liS0HYbIuk9WY8B0";
+const APP_SLUG: &str = "vellistry";
+const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+const EXPIRED: &str = "GitHub device code expired. Start Vellistry sign-in again.";
 const POLL: Duration = Duration::from_millis(25);
 const MAX_BODY: u64 = 2 * 1024 * 1024;
 const MAX_PAGES: usize = 1000;
@@ -51,75 +44,88 @@ pub struct Repository {
     pub clone_url: String,
 }
 
-struct Config {
-    client_id: String,
-    token_url: Url,
-    app_slug: String,
-    callback_port: u16,
+struct RepositoryGrant {
+    repository: Repository,
+    contents_readable: bool,
 }
 
-impl Config {
-    fn compiled() -> Result<Self, String> {
-        Self::parse(
-            option_env!("MDWELL_GITHUB_CLIENT_ID"),
-            option_env!("MDWELL_GITHUB_BROKER_URL"),
-            option_env!("MDWELL_GITHUB_APP_SLUG"),
-            option_env!("MDWELL_GITHUB_CALLBACK_PORT"),
-        )
-    }
+/// Safe to send over a Tauri Channel. The device code is deliberately private.
+#[derive(Serialize, Clone)]
+pub struct DeviceAuthorization {
+    pub user_code: String,
+    pub verification_uri: String,
+    pub expires_in: u64,
+    pub interval: u64,
+}
 
-    fn parse(
-        id: Option<&str>,
-        broker: Option<&str>,
-        slug: Option<&str>,
-        port: Option<&str>,
-    ) -> Result<Self, String> {
-        let required = |value: Option<&str>, name: &str| -> Result<String, String> {
-            value
-                .filter(|v| !v.trim().is_empty())
-                .map(str::to_owned)
-                .ok_or_else(|| format!("Missing compile-time GitHub configuration: {name}."))
-        };
-        let client_id = required(id, "MDWELL_GITHUB_CLIENT_ID")?;
-        let broker = required(broker, "MDWELL_GITHUB_BROKER_URL")?;
-        let app_slug = required(slug, "MDWELL_GITHUB_APP_SLUG")?;
-        let port = required(port, "MDWELL_GITHUB_CALLBACK_PORT")?;
-        let callback_port = port.parse::<u16>().ok()
-            .filter(|value| *value >= 1024 && port.bytes().all(|b| b.is_ascii_digit()))
-            .ok_or_else(|| "Invalid MDWELL_GITHUB_CALLBACK_PORT: expected an unprivileged decimal port from 1024 to 65535.".to_string())?;
-        if !client_id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-            || !app_slug
+#[derive(Deserialize)]
+struct DeviceResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    expires_in: u64,
+    #[serde(default = "default_interval")]
+    interval: u64,
+}
+fn default_interval() -> u64 {
+    5
+}
+impl Drop for DeviceResponse {
+    fn drop(&mut self) {
+        self.device_code.zeroize();
+    }
+}
+impl DeviceResponse {
+    fn authorization(&self) -> Result<DeviceAuthorization, String> {
+        if self.device_code.is_empty()
+            || self.device_code.len() > 4096
+            || !self.device_code.bytes().all(|b| b.is_ascii_graphic())
+            || self.user_code.is_empty()
+            || self.user_code.len() > 128
+            || !self
+                .user_code
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            || self.verification_uri != "https://github.com/login/device"
+            || self.expires_in == 0
+            || self.expires_in > 86400
+            || self.interval == 0
+            || self.interval > 86400
         {
-            return Err("Invalid GitHub client ID or app slug configuration.".into());
+            return Err("GitHub returned an invalid device authorization.".into());
         }
-        let mut token_url =
-            Url::parse(&broker).map_err(|_| "Invalid GitHub broker URL.".to_string())?;
-        if token_url.scheme() != "https"
-            || token_url.host_str().is_none()
-            || !token_url.username().is_empty()
-            || token_url.password().is_some()
-            || token_url.query().is_some()
-            || token_url.fragment().is_some()
-        {
-            return Err(
-                "GitHub broker must be an HTTPS URL without credentials, query, or fragment."
-                    .into(),
-            );
-        }
-        // A broker base such as https://host/github becomes https://host/github/token.
-        let path = format!("{}/token", token_url.path().trim_end_matches('/'));
-        token_url.set_path(&path);
-        Ok(Self {
-            client_id,
-            token_url,
-            app_slug,
-            callback_port,
+        Ok(DeviceAuthorization {
+            user_code: self.user_code.clone(),
+            verification_uri: self.verification_uri.clone(),
+            expires_in: self.expires_in,
+            interval: self.interval,
         })
     }
+}
+
+struct Config {
+    client_id: String,
+    device_url: Url,
+    token_url: Url,
+    app_slug: String,
+}
+impl Config {
+    fn compiled() -> Result<Self, String> {
+        Ok(Self {
+            client_id: CLIENT_ID.into(),
+            device_url: Url::parse("https://github.com/login/device/code")
+                .map_err(|_| "Invalid GitHub device URL.")?,
+            token_url: Url::parse("https://github.com/login/oauth/access_token")
+                .map_err(|_| "Invalid GitHub token URL.")?,
+            app_slug: APP_SLUG.into(),
+        })
+    }
+}
+
+// Transport errors are classified without retaining URLs, bodies, or library errors.
+enum PollError {
+    Transient,
+    Fatal(String),
 }
 
 // These types intentionally do not implement Debug. Only the OS credential store persists them.
@@ -151,6 +157,7 @@ struct TokenResponse {
     refresh_token_expires_in: Option<u64>,
     token_type: Option<String>,
     error: Option<String>,
+    interval: Option<u64>,
 }
 
 impl Drop for TokenResponse {
@@ -167,7 +174,7 @@ impl Drop for TokenResponse {
 impl TokenResponse {
     fn into_saved(mut self, login: String, now: u64) -> Result<SavedToken, String> {
         if self.error.is_some() {
-            return Err("GitHub broker rejected the token grant. Sign in again.".into());
+            return Err("GitHub rejected the token grant. Sign in to Vellistry again.".into());
         }
         let valid_secret =
             |s: &str| !s.is_empty() && s.len() <= 4096 && s.bytes().all(|b| b.is_ascii_graphic());
@@ -185,7 +192,7 @@ impl TokenResponse {
             || (self.expires_in.is_some()
                 && (self.refresh_token.is_none() || self.refresh_token_expires_in.is_none()))
         {
-            return Err("GitHub broker returned an invalid token response.".into());
+            return Err("GitHub returned an invalid token response.".into());
         }
         let expiry = |seconds: Option<u64>| -> Result<Option<u64>, String> {
             seconds
@@ -206,6 +213,7 @@ impl TokenResponse {
     }
 }
 
+// Errors crossing these native boundaries must be sanitized, user-facing guidance.
 trait Store: Send + Sync {
     fn load(&self, client_id: &str) -> Result<Option<SavedToken>, String>;
     fn save(&self, client_id: &str, token: &SavedToken) -> Result<(), String>;
@@ -274,8 +282,8 @@ mod linux_store {
     use dbus_secret_service::{Collection, EncryptionType, Item, SecretService};
     use std::{collections::HashMap, sync::mpsc};
 
-    const LOCKED: &str = "GitHub credential storage is locked or requires a prompt. Unlock your desktop keyring outside mdwell and retry.";
-    const UNAVAILABLE: &str = "GitHub Secret Service is unavailable or timed out. Check your desktop keyring outside mdwell and retry.";
+    const LOCKED: &str = "GitHub credential storage is locked or requires a prompt. Unlock your desktop keyring outside Vellistry and retry.";
+    const UNAVAILABLE: &str = "GitHub Secret Service is unavailable or timed out. Check your desktop keyring outside Vellistry and retry.";
     static CONNECTING: AtomicBool = AtomicBool::new(false);
 
     fn error(error: dbus_secret_service::Error) -> String {
@@ -367,7 +375,7 @@ mod linux_store {
                 .map_err(error)?;
         }
         if items.len() > 1 {
-            return Err("Multiple GitHub keyring entries match. Resolve them in your desktop keyring outside mdwell.".into());
+            return Err("Multiple GitHub keyring entries match. Resolve them in your desktop keyring outside Vellistry.".into());
         }
         let item = items.pop();
         if let Some(item) = &item {
@@ -428,7 +436,7 @@ mod linux_store {
     fn locked_and_prompt_errors_require_external_unlock() {
         assert!(require_unlocked(true)
             .unwrap_err()
-            .contains("outside mdwell"));
+            .contains("outside Vellistry"));
         assert!(require_unlocked(false).is_ok());
         assert_eq!(error(dbus_secret_service::Error::Prompt), LOCKED);
         assert_eq!(error(dbus_secret_service::Error::Locked), LOCKED);
@@ -436,7 +444,19 @@ mod linux_store {
     }
 }
 
+// Never return raw response bodies, request URLs, credentials, or library errors.
 trait Transport: Send + Sync {
+    fn device(&self, _url: &Url, _client_id: &str) -> Result<DeviceResponse, String> {
+        Err("GitHub device authorization is unavailable.".into())
+    }
+    fn poll_token(
+        &self,
+        url: &Url,
+        fields: &[(&str, &str)],
+        _remaining: Duration,
+    ) -> Result<TokenResponse, PollError> {
+        self.token(url, fields).map_err(PollError::Fatal)
+    }
     fn token(&self, url: &Url, fields: &[(&str, &str)]) -> Result<TokenResponse, String>;
     fn get(&self, path: &str, access_token: &str) -> Result<serde_json::Value, String>;
     fn avatar(&self, url: &Url) -> Result<Avatar, String>;
@@ -544,7 +564,7 @@ impl Http {
                 .redirect(Policy::none())
                 .connect_timeout(Duration::from_secs(5))
                 .timeout(Duration::from_secs(15))
-                .user_agent("mdwell-desktop/0.1")
+                .user_agent("vellistry-desktop/0.1")
                 .build()
                 .map_err(|_| "Cannot initialize GitHub HTTPS client.".into()),
             avatar_client: Client::builder()
@@ -552,10 +572,30 @@ impl Http {
                 .redirect(Policy::none())
                 .connect_timeout(Duration::from_secs(3))
                 .timeout(Duration::from_secs(5))
-                .user_agent("mdwell-desktop/0.1")
+                .user_agent("vellistry-desktop/0.1")
                 .build()
                 .map_err(|_| "Cannot initialize GitHub avatar client.".into()),
         }
+    }
+    fn auth_post<T: DeserializeOwned>(
+        &self,
+        url: &Url,
+        fields: &[(&str, &str)],
+        timeout: Duration,
+    ) -> Result<T, PollError> {
+        let response = self
+            .client()
+            .map_err(PollError::Fatal)?
+            .post(url.clone())
+            .header("Accept", "application/json")
+            .form(fields)
+            .timeout(timeout.min(Duration::from_secs(15)))
+            .send()
+            .map_err(|_| PollError::Transient)?;
+        if response.status().is_server_error() || response.status().as_u16() == 429 {
+            return Err(PollError::Transient);
+        }
+        auth_response_json(response)
     }
     fn client(&self) -> Result<&Client, String> {
         self.client.as_ref().map_err(Clone::clone)
@@ -571,33 +611,63 @@ impl Http {
     }
 }
 fn response_json<T: DeserializeOwned>(response: reqwest::blocking::Response) -> Result<T, String> {
+    auth_response_json(response).map_err(|error| match error {
+        PollError::Transient => "Cannot read GitHub service response.".into(),
+        PollError::Fatal(error) => error,
+    })
+}
+fn auth_response_json<T: DeserializeOwned>(
+    response: reqwest::blocking::Response,
+) -> Result<T, PollError> {
     let status = response.status();
     if !status.is_success() {
         // Never include response bodies, URLs, or underlying library errors: they may contain secrets.
-        return Err(match status.as_u16() {
+        return Err(PollError::Fatal(match status.as_u16() {
             401 => "GitHub authentication was rejected. Sign in again.".into(),
             403 | 429 => {
                 "GitHub request denied or rate limited. Check app permissions or retry later."
                     .into()
             }
             _ => format!("GitHub service request failed (HTTP {}).", status.as_u16()),
-        });
+        }));
     }
     if response.content_length().is_some_and(|n| n > MAX_BODY) {
-        return Err("GitHub response exceeded the size limit.".into());
+        return Err(PollError::Fatal(
+            "GitHub response exceeded the size limit.".into(),
+        ));
     }
     let mut bytes = Zeroizing::new(Vec::new());
     response
         .take(MAX_BODY + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| "Cannot read GitHub service response.".to_string())?;
+        .map_err(|_| PollError::Transient)?;
     if bytes.len() as u64 > MAX_BODY {
-        return Err("GitHub response exceeded the size limit.".into());
+        return Err(PollError::Fatal(
+            "GitHub response exceeded the size limit.".into(),
+        ));
     }
     serde_json::from_slice(&bytes)
-        .map_err(|_| "GitHub service returned an invalid response.".into())
+        .map_err(|_| PollError::Fatal("GitHub service returned an invalid response.".into()))
 }
 impl Transport for Http {
+    fn device(&self, url: &Url, client_id: &str) -> Result<DeviceResponse, String> {
+        self.auth_post(url, &[("client_id", client_id)], Duration::from_secs(15))
+            .map_err(|error| match error {
+                PollError::Transient => {
+                    "GitHub device authorization is unreachable or rate limited. Retry later."
+                        .into()
+                }
+                PollError::Fatal(error) => error,
+            })
+    }
+    fn poll_token(
+        &self,
+        url: &Url,
+        fields: &[(&str, &str)],
+        remaining: Duration,
+    ) -> Result<TokenResponse, PollError> {
+        self.auth_post(url, fields, remaining)
+    }
     fn avatar(&self, url: &Url) -> Result<Avatar, String> {
         response_avatar(
             self.avatar_request(url)?
@@ -606,15 +676,10 @@ impl Transport for Http {
         )
     }
     fn token(&self, url: &Url, fields: &[(&str, &str)]) -> Result<TokenResponse, String> {
-        let fields: BTreeMap<_, _> = fields.iter().copied().collect();
-        response_json(
-            self.client()?
-                .post(url.clone())
-                .header("Accept", "application/json")
-                .json(&fields)
-                .send()
-                .map_err(|_| "GitHub token broker is unreachable or timed out.".to_string())?,
-        )
+        self.auth_post(url, fields, Duration::from_secs(15)).map_err(|error| match error {
+            PollError::Transient => "GitHub token service is unreachable or rate limited. Sign in to Vellistry again.".into(),
+            PollError::Fatal(error) => error,
+        })
     }
     fn get(&self, path: &str, access_token: &str) -> Result<serde_json::Value, String> {
         // Paths are constructed locally, never from pagination links or server-provided URLs.
@@ -637,7 +702,7 @@ struct CredentialState {
 impl CredentialState {
     fn ensure_clean(&self) -> Result<(), String> {
         if self.cleanup_required {
-            Err("Cancelled GitHub credentials could not be cleaned up. Unlock your keyring outside mdwell, then disconnect or sign in again.".into())
+            Err("Unsafe GitHub credentials could not be cleaned up. Unlock your keyring outside Vellistry, then disconnect or sign in again.".into())
         } else {
             Ok(())
         }
@@ -718,9 +783,12 @@ impl Github {
         guard.ensure_clean()?;
         Ok(self.account(self.store.load(&config.client_id)?.as_ref()))
     }
+    /// Request a device code, notify once, then poll on the calling blocking worker.
+    /// Cancellation interrupts waits within POLL; an already in-flight HTTP request is
+    /// bounded by its 15-second timeout (or remaining device lifetime, if shorter).
     pub fn start(
         &self,
-        open: impl FnOnce(String) -> Result<(), String>,
+        notify: impl FnOnce(DeviceAuthorization) -> Result<(), String>,
     ) -> Result<AccountStatus, String> {
         let config = self.config()?;
         let generation = self.generation.load(Ordering::SeqCst);
@@ -734,52 +802,19 @@ impl Github {
             }
         }
         let _pending = Pending(&self.pending);
-        let port = config.callback_port;
-        // Establish the exact registered callback endpoint before opening the browser.
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::AddrInUse {
-                    format!("GitHub callback port {port} is busy. Close the application using it and retry; no fallback port is used.")
-                } else {
-                    format!("Cannot bind GitHub callback listener at 127.0.0.1:{port}. Check local network permissions and retry.")
-                }
-            })?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|_| "Cannot initialize GitHub callback listener.".to_string())?;
-        let redirect = format!("http://127.0.0.1:{port}/callback");
-        let verifier = Zeroizing::new(random_secret()?);
-        let state = Zeroizing::new(random_secret()?);
-        let mut url = Url::parse("https://github.com/login/oauth/authorize")
-            .map_err(|_| "Invalid GitHub authorization URL.".to_string())?;
-        url.query_pairs_mut().extend_pairs([
-            ("client_id", config.client_id.as_str()),
-            ("redirect_uri", redirect.as_str()),
-            ("state", state.as_str()),
-            ("code_challenge", challenge(&verifier).as_str()),
-            ("code_challenge_method", "S256"),
-            ("scope", "offline_access"),
-        ]);
         self.check_generation(generation)?;
-        open(url.into())
-            .map_err(|_| "Cannot open the system browser for GitHub sign-in.".to_string())?;
-        let deadline = Instant::now() + CALLBACK_TIMEOUT;
-        let code = Zeroizing::new(wait_callback(&listener, port, &state, deadline, || {
-            self.check_generation(generation)
-        })?);
+        let device = self
+            .transport
+            .device(&config.device_url, &config.client_id)?;
         self.check_generation(generation)?;
-        let response = self.transport.token(
-            &config.token_url,
-            &[
-                ("grant_type", "authorization_code"),
-                ("client_id", &config.client_id),
-                ("code", &code),
-                ("code_verifier", &verifier),
-                ("redirect_uri", &redirect),
-            ],
-        )?;
+        let authorization = device.authorization()?;
+        let deadline = Instant::now() + Duration::from_secs(authorization.expires_in);
+        notify(authorization)
+            .map_err(|_| "Cannot display the GitHub device code in Vellistry.".to_string())?;
+        let response = self.poll_device(config, &device, deadline, generation)?;
         self.check_generation(generation)?;
         let mut token = response.into_saved(String::new(), now()?)?;
+        self.check_generation(generation)?;
         let profile = self.transport.get("/user", &token.access_token)?;
         token.login = profile
             .get("login")
@@ -792,9 +827,100 @@ impl Github {
             .get("avatar_url")
             .and_then(|v| v.as_str())
             .and_then(|value| validated_avatar_url(value).ok())
-            .and_then(|url| self.transport.avatar(&url).ok())
+            .and_then(|url| {
+                self.check_generation(generation).ok()?;
+                self.transport.avatar(&url).ok()
+            })
             .and_then(|avatar| avatar.data_url().ok());
         self.commit_sign_in(&config.client_id, token, generation)
+    }
+    fn wait_poll(&self, delay: Duration, deadline: Instant, generation: u64) -> Result<(), String> {
+        let next = Instant::now()
+            .checked_add(delay)
+            .unwrap_or(deadline)
+            .min(deadline);
+        loop {
+            self.check_generation(generation)?;
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(EXPIRED.into());
+            }
+            if now >= next {
+                return Ok(());
+            }
+            thread::sleep(POLL.min(next - now));
+        }
+    }
+    fn poll_device(
+        &self,
+        config: &Config,
+        device: &DeviceResponse,
+        deadline: Instant,
+        generation: u64,
+    ) -> Result<TokenResponse, String> {
+        let mut interval = device.interval;
+        let mut delay = interval;
+        loop {
+            // Wait before the first poll as well as every subsequent attempt. Backoff is
+            // measured from response completion, never from request start.
+            self.wait_poll(Duration::from_secs(delay), deadline, generation)?;
+            self.check_generation(generation)?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(EXPIRED.into());
+            }
+            let result = self.transport.poll_token(
+                &config.token_url,
+                &[
+                    ("client_id", &config.client_id),
+                    ("device_code", &device.device_code),
+                    ("grant_type", DEVICE_GRANT),
+                ],
+                remaining,
+            );
+            self.check_generation(generation)?;
+            if Instant::now() >= deadline {
+                return Err(EXPIRED.into());
+            }
+            match result {
+                Err(PollError::Transient) => {
+                    delay = delay.saturating_mul(2).max(interval).min(86400);
+                }
+                Err(PollError::Fatal(error)) => return Err(error),
+                Ok(response) => {
+                    if response.error.is_some() && response.access_token.is_some() {
+                        return Err("GitHub returned an invalid token response.".into());
+                    }
+                    match response.error.as_deref() {
+                        None => return Ok(response),
+                        Some("authorization_pending") => {
+                            delay = interval;
+                        }
+                        Some("slow_down") => {
+                            interval = slowed_interval(interval, response.interval)?;
+                            delay = interval;
+                        }
+                        Some("expired_token") => return Err(EXPIRED.into()),
+                        Some("access_denied") => {
+                            return Err(
+                                "GitHub authorization was denied. Start Vellistry sign-in again."
+                                    .into(),
+                            )
+                        }
+                        Some("incorrect_device_code" | "invalid_grant" | "invalid_device_code") => {
+                            return Err(
+                                "GitHub device code is invalid. Start Vellistry sign-in again."
+                                    .into(),
+                            )
+                        }
+                        Some(_) => return Err(
+                            "GitHub rejected device authorization. Start Vellistry sign-in again."
+                                .into(),
+                        ),
+                    }
+                }
+            }
+        }
     }
     fn commit_sign_in(
         &self,
@@ -803,6 +929,10 @@ impl Github {
         generation: u64,
     ) -> Result<AccountStatus, String> {
         let mut guard = self.sign_in_lock(generation)?;
+        if guard.cleanup_required {
+            self.store.delete(client_id)?;
+            guard.cleanup_required = false;
+        }
         let mut previous = self.store.load(client_id)?;
         self.check_generation(generation)?;
         let saved = self.save_profile(client_id, &mut token);
@@ -818,7 +948,7 @@ impl Github {
             if cleanup.is_err() {
                 // Fail closed in this process if secure storage cannot undo the write.
                 guard.cleanup_required = true;
-                return Err("GitHub sign-in cancelled, but secure credential cleanup failed. Unlock your keyring outside mdwell and disconnect before restarting.".into());
+                return Err("GitHub sign-in cancelled, but secure credential cleanup failed. Unlock your keyring outside Vellistry and disconnect before restarting.".into());
             }
             return Err(CANCELLED.into());
         }
@@ -855,7 +985,7 @@ impl Github {
         let Ok(config) = &self.config else {
             return Ok(None);
         };
-        let guard = self.lock()?;
+        let mut guard = self.lock()?;
         guard.ensure_clean()?;
         let Some(mut token) = self.store.load(&config.client_id)? else {
             return Ok(None);
@@ -870,37 +1000,97 @@ impl Github {
                 .as_deref()
                 .filter(|_| token.refresh_expires_at.is_some_and(|expiry| expiry > time))
                 .ok_or_else(|| "GitHub authorization expired. Sign in again.".to_string())?;
-            let response = self.transport.token(
-                &config.token_url,
-                &[
-                    ("grant_type", "refresh_token"),
-                    ("client_id", &config.client_id),
-                    ("refresh_token", refresh),
-                ],
-            )?;
-            let mut refreshed = response.into_saved(token.login.clone(), now()?)?;
-            refreshed.avatar_data_url = token.avatar_data_url.take();
-            token = refreshed;
-            // Persist rotated credentials before returning them. No plaintext or in-memory fallback.
-            self.save_profile(&config.client_id, &mut token)?;
+            // A lost network/storage reply may still have consumed the refresh token.
+            // Never retry it after an ambiguous failure, even if deleting the keyring fails.
+            guard.cleanup_required = true;
+            let rotated = (|| {
+                let response = self.transport.token(
+                    &config.token_url,
+                    &[
+                        ("grant_type", "refresh_token"),
+                        ("client_id", &config.client_id),
+                        ("refresh_token", refresh),
+                    ],
+                )?;
+                let mut refreshed = response.into_saved(token.login.clone(), now()?)?;
+                refreshed.avatar_data_url = token.avatar_data_url.take();
+                self.save_profile(&config.client_id, &mut refreshed)?;
+                Ok::<_, String>(refreshed)
+            })();
+            match rotated {
+                Ok(refreshed) => {
+                    token = refreshed;
+                    guard.cleanup_required = false;
+                }
+                Err(error) => {
+                    if self.store.delete(&config.client_id).is_ok() {
+                        guard.cleanup_required = false;
+                    }
+                    return Err(error);
+                }
+            }
         }
         Ok(Some(token.access_token.clone()))
+    }
+    /// Native add/sync preflight. None leaves authentication to external Git helpers.
+    pub fn token_for_repository(&self, url: &str) -> Result<Option<String>, String> {
+        let target = repository_name(url)?;
+        let Some(token) = self
+            .access_token()
+            .map_err(|error| format!("GitHub authentication or token refresh failed: {error}"))?
+        else {
+            return Ok(None);
+        };
+        let token = Zeroizing::new(token);
+        // Discovery must use this exact token, not reload or refresh credentials again.
+        let grants = self.repository_grants_with_token(&token).map_err(|error| {
+            format!("Could not verify GitHub installation repository access: {error}")
+        })?;
+        let mut matching = grants
+            .iter()
+            .filter(|grant| grant.repository.full_name.eq_ignore_ascii_case(&target))
+            .peekable();
+        if matching.peek().is_none() {
+            return Err("GitHub repository permission is missing. Install or configure the Vellistry GitHub App to include this repository, and ensure your signed-in account has access.".into());
+        }
+        if !matching.any(|grant| grant.contents_readable) {
+            return Err("GitHub App Contents read permission is missing for this repository. Ask the installation owner to approve the Vellistry GitHub App Contents Read-only permission update, then reauthorize Vellistry by disconnecting and signing in again.".into());
+        }
+        Ok(Some(token.to_string()))
     }
     pub fn repositories(&self) -> Result<Vec<Repository>, String> {
         let access_token = Zeroizing::new(
             self.access_token()?
                 .ok_or_else(|| "Connect a GitHub account first.".to_string())?,
         );
+        Ok(self
+            .repository_grants_with_token(&access_token)?
+            .into_iter()
+            .map(|grant| grant.repository)
+            .collect())
+    }
+    fn repository_grants_with_token(
+        &self,
+        access_token: &str,
+    ) -> Result<Vec<RepositoryGrant>, String> {
         let mut repositories = BTreeMap::new();
-        for installation in self.pages("/user/installations", "installations", &access_token)? {
+        for installation in self.pages("/user/installations", "installations", access_token)? {
             let id = installation
                 .get("id")
                 .and_then(|v| v.as_u64())
                 .ok_or_else(|| "GitHub returned an invalid installation.".to_string())?;
+            // Older responses/fixtures may omit permissions entirely. Once present,
+            // metadata visibility alone is not evidence that Git can read Contents.
+            let contents_readable = installation.get("permissions").is_none_or(|permissions| {
+                matches!(
+                    permissions.get("contents").and_then(|v| v.as_str()),
+                    Some("read" | "write")
+                )
+            });
             for value in self.pages(
                 &format!("/user/installations/{id}/repositories"),
                 "repositories",
-                &access_token,
+                access_token,
             )? {
                 let repository: Repository = serde_json::from_value(value)
                     .map_err(|_| "GitHub returned an invalid repository.".to_string())?;
@@ -916,7 +1106,13 @@ impl Github {
                 {
                     return Err("Invalid GitHub clone URL.".into());
                 }
-                repositories.insert(repository.id, repository);
+                let grant = repositories
+                    .entry(repository.id)
+                    .or_insert(RepositoryGrant {
+                        repository,
+                        contents_readable: false,
+                    });
+                grant.contents_readable |= contents_readable;
             }
         }
         Ok(repositories.into_values().collect())
@@ -954,171 +1150,90 @@ impl Github {
     }
 }
 
+fn repository_name(input: &str) -> Result<String, String> {
+    let invalid = || {
+        "Invalid GitHub repository URL. Use https://github.com/owner/repo without credentials, query, or fragment.".to_string()
+    };
+    let url = Url::parse(input).map_err(|_| invalid())?;
+    let (authority, raw_path) = input
+        .strip_prefix("https://")
+        .and_then(|value| value.split_once('/'))
+        .ok_or_else(invalid)?;
+    if !authority.eq_ignore_ascii_case("github.com")
+        || url.scheme() != "https"
+        || url.host_str() != Some("github.com")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !input.bytes().all(|b| b.is_ascii_graphic() && b != b'\\')
+        // Reject URL-parser normalization (notably dot segments) rather than authorize
+        // a repository different from the one written in the original URL.
+        || url.path().strip_prefix('/') != Some(raw_path)
+    {
+        return Err(invalid());
+    }
+    let path = raw_path.strip_suffix('/').unwrap_or(raw_path);
+    let (owner, repo) = path.split_once('/').ok_or_else(invalid)?;
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    if owner.is_empty()
+        || owner.len() > 39
+        || owner.starts_with('-')
+        || owner.ends_with('-')
+        || !owner
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        || repo.is_empty()
+        || repo.len() > 100
+        || matches!(repo, "." | "..")
+        || !repo
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return Err(invalid());
+    }
+    Ok(format!("{owner}/{repo}"))
+}
+
 fn now() -> Result<u64, String> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|t| t.as_secs())
         .map_err(|_| "System clock is invalid for GitHub authentication.".into())
 }
-fn random_secret() -> Result<String, String> {
-    let mut bytes = Zeroizing::new([0u8; 32]);
-    OsRng
-        .try_fill_bytes(bytes.as_mut())
-        .map_err(|_| "Secure randomness is unavailable.".to_string())?;
-    Ok(URL_SAFE_NO_PAD.encode(bytes.as_ref()))
-}
-fn challenge(verifier: &str) -> String {
-    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
-}
-
-enum Callback {
-    Code(String),
-    Denied,
-}
-fn parse_callback(header: &str, port: u16, expected_state: &str) -> Option<Callback> {
-    let mut lines = header.split("\r\n");
-    let mut request = lines.next()?.split_whitespace();
-    if request.next()? != "GET" {
-        return None;
+fn slowed_interval(interval: u64, server: Option<u64>) -> Result<u64, String> {
+    let interval = interval.saturating_add(5).max(server.unwrap_or(0));
+    if interval > 86400 {
+        return Err("GitHub returned an invalid polling interval.".into());
     }
-    let target = request.next()?;
-    if request.next()? != "HTTP/1.1"
-        || request.next().is_some()
-        || !target.starts_with("/callback?")
-    {
-        return None;
-    }
-    let hosts: Vec<_> = lines
-        .filter_map(|line| line.split_once(':'))
-        .filter(|(name, _)| name.eq_ignore_ascii_case("host"))
-        .collect();
-    if hosts.len() != 1 || hosts[0].1.trim() != format!("127.0.0.1:{port}") {
-        return None;
-    }
-    let url = Url::parse(&format!("http://127.0.0.1:{port}{target}")).ok()?;
-    if url.path() != "/callback" || url.fragment().is_some() {
-        return None;
-    }
-    let params: Vec<_> = url.query_pairs().collect();
-    let single = |key: &str| -> Option<&str> {
-        let mut matches = params.iter().filter(|(k, _)| k == key);
-        let value = matches.next()?.1.as_ref();
-        if matches.next().is_some() {
-            None
-        } else {
-            Some(value)
-        }
-    };
-    let state = single("state")?;
-    if !bool::from(state.as_bytes().ct_eq(expected_state.as_bytes())) {
-        return None;
-    }
-    let codes = params.iter().filter(|(k, _)| k == "code").count();
-    let errors = params.iter().filter(|(k, _)| k == "error").count();
-    if codes == 0 && errors == 1 {
-        return Some(Callback::Denied);
-    }
-    if codes != 1 || errors != 0 {
-        return None;
-    }
-    let code = single("code")?;
-    if code.is_empty() || code.len() > 4096 || !code.bytes().all(|b| b.is_ascii_graphic()) {
-        return None;
-    }
-    Some(Callback::Code(code.to_owned()))
-}
-
-fn wait_callback(
-    listener: &TcpListener,
-    port: u16,
-    state: &str,
-    deadline: Instant,
-    check: impl Fn() -> Result<(), String>,
-) -> Result<String, String> {
-    loop {
-        check()?;
-        if Instant::now() >= deadline {
-            return Err("GitHub sign-in timed out. Try again.".into());
-        }
-        match listener.accept() {
-            Ok((mut stream, peer)) => {
-                if !peer.ip().is_loopback() {
-                    continue;
-                }
-                let header = read_callback(&mut stream, deadline, &check)?;
-                let callback = header
-                    .as_deref()
-                    .and_then(|h| parse_callback(h, port, state));
-                let (status, body) = if callback.is_some() {
-                    (
-                        "200 OK",
-                        "GitHub callback received. You can close this window and return to mdwell.",
-                    )
-                } else {
-                    ("400 Bad Request", "Invalid GitHub callback.")
-                };
-                // Fixed response, never reflect the code/state or load any external content.
-                let response = format!("HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'none'\r\n\r\n{body}", body.len());
-                let _ = stream.set_nonblocking(false);
-                let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
-                let _ = stream.write_all(response.as_bytes());
-                match callback {
-                    Some(Callback::Code(code)) => {
-                        check()?;
-                        return Ok(code);
-                    }
-                    Some(Callback::Denied) => return Err("GitHub authorization was denied.".into()),
-                    None => continue,
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(POLL),
-            Err(_) => return Err("GitHub callback listener failed.".into()),
-        }
-    }
-}
-fn read_callback(
-    stream: &mut TcpStream,
-    deadline: Instant,
-    check: &impl Fn() -> Result<(), String>,
-) -> Result<Option<Zeroizing<String>>, String> {
-    stream
-        .set_nonblocking(true)
-        .map_err(|_| "Cannot read GitHub callback.".to_string())?;
-    let deadline = deadline.min(Instant::now() + Duration::from_secs(2));
-    let mut bytes = Zeroizing::new(Vec::new());
-    let mut chunk = Zeroizing::new([0u8; 1024]);
-    while bytes.len() < 8192 && Instant::now() < deadline {
-        check()?;
-        match stream.read(chunk.as_mut()) {
-            Ok(0) => return Ok(None),
-            Ok(count) => {
-                bytes.extend_from_slice(&chunk[..count]);
-                if let Some(end) = bytes.windows(4).position(|b| b == b"\r\n\r\n") {
-                    return Ok(std::str::from_utf8(&bytes[..end + 4])
-                        .ok()
-                        .map(|s| Zeroizing::new(s.to_owned())));
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(POLL),
-            Err(_) => return Ok(None),
-        }
-    }
-    Ok(None)
+    Ok(interval)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{atomic::AtomicUsize, Arc};
+    use std::{
+        io::Write,
+        net::TcpListener,
+        sync::{atomic::AtomicUsize, Arc},
+    };
 
     #[derive(Default)]
     struct MemoryStore {
         json: Mutex<Option<String>>,
+        fail_load: AtomicBool,
         fail_save: AtomicBool,
         fail_avatar: AtomicBool,
     }
     impl Store for Arc<MemoryStore> {
         fn load(&self, _: &str) -> Result<Option<SavedToken>, String> {
+            if self.fail_load.load(Ordering::SeqCst) {
+                return Err(
+                    "Cannot read native GitHub credential storage. Unlock your keychain and retry."
+                        .into(),
+                );
+            }
             self.json
                 .lock()
                 .unwrap()
@@ -1144,6 +1259,10 @@ mod tests {
         refreshes: AtomicUsize,
         fail: AtomicBool,
         paths: Mutex<Vec<String>>,
+        get_tokens: Mutex<Vec<String>>,
+        no_installations: AtomicBool,
+        installations: Mutex<Option<serde_json::Value>>,
+        api_fail: AtomicBool,
         avatar_fail: AtomicBool,
         avatar_url: Mutex<String>,
         avatars: AtomicUsize,
@@ -1154,13 +1273,34 @@ mod tests {
                 refreshes: AtomicUsize::new(0),
                 fail: AtomicBool::new(false),
                 paths: Mutex::new(Vec::new()),
+                get_tokens: Mutex::new(Vec::new()),
+                no_installations: AtomicBool::new(false),
+                installations: Mutex::new(None),
+                api_fail: AtomicBool::new(false),
                 avatar_fail: AtomicBool::new(false),
                 avatar_url: Mutex::new("https://avatars.githubusercontent.com/u/1?v=4".into()),
                 avatars: AtomicUsize::new(0),
             }
         }
     }
+    fn device_fixture() -> DeviceResponse {
+        serde_json::from_value(
+            serde_json::json!({"device_code":"private-device-code", "user_code":"ABCD-EFGH",
+            "verification_uri":"https://github.com/login/device", "expires_in":60, "interval":1}),
+        )
+        .unwrap()
+    }
+    fn notify_device(value: DeviceAuthorization) -> Result<(), String> {
+        assert_eq!(value.user_code, "ABCD-EFGH");
+        assert_eq!(value.verification_uri, "https://github.com/login/device");
+        Ok(())
+    }
     impl Transport for Arc<MockTransport> {
+        fn device(&self, url: &Url, client_id: &str) -> Result<DeviceResponse, String> {
+            assert_eq!(url.as_str(), "https://github.com/login/device/code");
+            assert_eq!(client_id, "client");
+            Ok(device_fixture())
+        }
         fn avatar(&self, url: &Url) -> Result<Avatar, String> {
             assert_eq!(url.host_str(), Some("avatars.githubusercontent.com"));
             self.avatars.fetch_add(1, Ordering::SeqCst);
@@ -1174,7 +1314,7 @@ mod tests {
         }
         fn token(&self, _: &Url, fields: &[(&str, &str)]) -> Result<TokenResponse, String> {
             if self.fail.load(Ordering::SeqCst) {
-                return Err("broker unavailable".into());
+                return Err("token service unavailable".into());
             }
             self.refreshes.fetch_add(1, Ordering::SeqCst);
             assert!(fields.iter().any(|(k, _)| *k == "client_id"));
@@ -1184,14 +1324,24 @@ mod tests {
             )
             .unwrap())
         }
-        fn get(&self, path: &str, _: &str) -> Result<serde_json::Value, String> {
+        fn get(&self, path: &str, token: &str) -> Result<serde_json::Value, String> {
             self.paths.lock().unwrap().push(path.into());
+            self.get_tokens.lock().unwrap().push(token.into());
+            if self.api_fail.load(Ordering::SeqCst) {
+                return Err("GitHub API is unreachable or timed out.".into());
+            }
             if path == "/user" {
                 return Ok(
                     serde_json::json!({"login":"octocat", "avatar_url": self.avatar_url.lock().unwrap().clone()}),
                 );
             }
             if path.starts_with("/user/installations?") {
+                if let Some(installations) = self.installations.lock().unwrap().as_ref() {
+                    return Ok(serde_json::json!({"installations": installations}));
+                }
+                if self.no_installations.load(Ordering::SeqCst) {
+                    return Ok(serde_json::json!({"installations": []}));
+                }
                 return Ok(serde_json::json!({"installations": [{"id": 1}, {"id":2}]}));
             }
             let repo = serde_json::json!({"id": 7, "full_name":"owner/repo", "private":true, "clone_url":"https://github.com/owner/repo.git"});
@@ -1287,7 +1437,7 @@ mod tests {
         let sign_in = thread::spawn(move || {
             let result = signer.start(|url| {
                 opened_send.send(()).unwrap();
-                callback_browser(url)
+                notify_device(url)
             });
             result_send.send(result).unwrap();
         });
@@ -1405,23 +1555,17 @@ mod tests {
     fn fixture() -> (Github, Arc<MemoryStore>, Arc<MockTransport>) {
         let store = Arc::new(MemoryStore::default());
         let transport = Arc::new(MockTransport::default());
-        // Tests choose an available port, then configure it explicitly just like a registered app.
-        let (reservation, port) = listener();
-        let port = port.to_string();
         let github = Github {
-            config: Config::parse(
-                Some("client"),
-                Some("https://broker.example/base"),
-                Some("test-app"),
-                Some(&port),
-            ),
+            config: Ok(Config {
+                client_id: "client".into(),
+                ..Config::compiled().unwrap()
+            }),
             store: Box::new(store.clone()),
             transport: Box::new(transport.clone()),
             credentials: Mutex::new(CredentialState::default()),
             pending: AtomicBool::new(false),
             generation: AtomicU64::new(0),
         };
-        drop(reservation);
         (github, store, transport)
     }
     fn saved(expiry: u64) -> SavedToken {
@@ -1433,15 +1577,6 @@ mod tests {
             login: "octocat".into(),
             avatar_data_url: None,
         }
-    }
-    fn request(port: u16, query: &str) -> String {
-        format!("GET /callback?{query} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n")
-    }
-    fn listener() -> (TcpListener, u16) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        (listener, port)
     }
     fn png() -> Vec<u8> {
         STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5v8AAAAASUVORK5CYII=").unwrap()
@@ -1476,13 +1611,13 @@ mod tests {
     fn optional_avatar_failures_and_disallowed_urls_do_not_block_sign_in() {
         let (github, _, transport) = fixture();
         transport.avatar_fail.store(true, Ordering::SeqCst);
-        let status = github.start(callback_browser).unwrap();
+        let status = github.start(notify_device).unwrap();
         assert!(status.connected);
         assert!(status.avatar_url.is_none());
         assert_eq!(transport.avatars.load(Ordering::SeqCst), 1);
         let (github, _, transport) = fixture();
         *transport.avatar_url.lock().unwrap() = "https://evil.example/avatar.png".into();
-        let status = github.start(callback_browser).unwrap();
+        let status = github.start(notify_device).unwrap();
         assert!(status.connected);
         assert!(status.avatar_url.is_none());
         assert_eq!(transport.avatars.load(Ordering::SeqCst), 0);
@@ -1525,7 +1660,7 @@ mod tests {
     fn small_keyring_limits_drop_only_optional_avatar() {
         let (github, store, _) = fixture();
         store.fail_avatar.store(true, Ordering::SeqCst);
-        let status = github.start(callback_browser).unwrap();
+        let status = github.start(notify_device).unwrap();
         assert!(status.connected);
         assert!(status.avatar_url.is_none());
         let saved = store.load("client").unwrap().unwrap();
@@ -1564,14 +1699,14 @@ mod tests {
     fn unconfigured_access_token_preserves_git_fallback() {
         let (mut github, store, transport) = fixture();
         store.save("client", &saved(1)).unwrap();
-        github.config = Config::parse(None, None, None, None);
+        github.config = Err("GitHub configuration unavailable in Vellistry.".into());
         assert!(github.access_token().unwrap().is_none());
         assert!(!github.status().unwrap().configured);
         assert!(github
-            .start(callback_browser)
+            .start(notify_device)
             .err()
             .unwrap()
-            .contains("MDWELL_GITHUB_CLIENT_ID"));
+            .contains("configuration unavailable"));
         assert_eq!(transport.refreshes.load(Ordering::SeqCst), 0);
         assert!(store.load("client").unwrap().is_some());
     }
@@ -1633,206 +1768,6 @@ mod tests {
     }
 
     #[test]
-    fn pkce_rfc_vector_and_random_state() {
-        assert_eq!(
-            challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
-            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
-        );
-        let a = random_secret().unwrap();
-        let b = random_secret().unwrap();
-        assert_eq!(a.len(), 43);
-        assert_ne!(a, b);
-        assert!(a
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'));
-    }
-    #[test]
-    fn config_is_explicit_and_https_only() {
-        assert!(Config::parse(None, None, None, None)
-            .err()
-            .unwrap()
-            .contains("MDWELL_GITHUB_CLIENT_ID"));
-        for broker in [
-            "http://broker.example",
-            "https://user:secret@broker.example",
-            "https://broker.example/?secret=x",
-            "https://broker.example/#x",
-        ] {
-            assert!(Config::parse(Some("id"), Some(broker), Some("app"), Some("1024")).is_err());
-        }
-        let (github, _, _) = fixture();
-        assert_eq!(
-            github.config().unwrap().token_url.as_str(),
-            "https://broker.example/base/token"
-        );
-        assert_eq!(
-            github.management_url().unwrap(),
-            "https://github.com/apps/test-app/installations/new"
-        );
-    }
-    #[test]
-    fn callback_port_is_required_and_unprivileged() {
-        let (mut github, _, _) = fixture();
-        github.config = Config::parse(
-            Some("client"),
-            Some("https://broker.example"),
-            Some("app"),
-            None,
-        );
-        assert!(!github.status().unwrap().configured);
-        assert!(github.access_token().unwrap().is_none());
-        assert!(github
-            .start(|_| panic!("missing port must not open browser"))
-            .err()
-            .unwrap()
-            .contains("MDWELL_GITHUB_CALLBACK_PORT"));
-        for port in [
-            "", " ", "0", "1", "80", "443", "1023", "65536", "-1024", "+1024", "1.5", "invalid",
-            " 1024", "1024 ",
-        ] {
-            assert!(Config::parse(
-                Some("client"),
-                Some("https://broker.example"),
-                Some("app"),
-                Some(port)
-            )
-            .is_err());
-        }
-        for port in ["1024", "65535"] {
-            let config = Config::parse(
-                Some("client"),
-                Some("https://broker.example"),
-                Some("app"),
-                Some(port),
-            )
-            .unwrap();
-            assert_eq!(config.callback_port.to_string(), port);
-        }
-    }
-
-    #[test]
-    fn compiled_config_without_callback_port_is_unconfigured() {
-        if option_env!("MDWELL_GITHUB_CALLBACK_PORT").is_none() {
-            assert!(Config::compiled().is_err());
-            assert!(!Github::new().status().unwrap().configured);
-        }
-    }
-
-    #[test]
-    fn busy_callback_port_fails_before_browser_without_fallback() {
-        let (mut github, store, transport) = fixture();
-        let (occupied, port) = listener();
-        github.config.as_mut().unwrap().callback_port = port;
-        let error = github
-            .start(|_| panic!("busy port must not open browser"))
-            .err()
-            .unwrap();
-        assert!(error.contains(&format!("port {port} is busy")));
-        assert!(error.contains("no fallback"));
-        assert!(!github.pending.load(Ordering::SeqCst));
-        assert!(store.load("client").unwrap().is_none());
-        assert_eq!(transport.refreshes.load(Ordering::SeqCst), 0);
-        drop(occupied);
-        let error = github
-            .start(|url| {
-                let url = Url::parse(&url).unwrap();
-                let params: BTreeMap<_, _> = url.query_pairs().collect();
-                assert_eq!(
-                    params.get("redirect_uri").unwrap(),
-                    &format!("http://127.0.0.1:{port}/callback")
-                );
-                // The callback listener is already live on the configured port before open is called.
-                assert!(TcpListener::bind(("127.0.0.1", port)).is_err());
-                github.cancel()?;
-                Ok(())
-            })
-            .err()
-            .unwrap();
-        assert_eq!(error, CANCELLED);
-    }
-
-    #[test]
-    fn callback_rejects_forgery_duplicates_and_wrong_host() {
-        assert!(
-            matches!(parse_callback(&request(1234,"code=abc&state=expected"),1234,"expected"),Some(Callback::Code(code)) if code == "abc")
-        );
-        for query in [
-            "code=abc&state=wrong",
-            "code=abc",
-            "code=a&code=b&state=expected",
-            "code=a&state=expected&state=expected",
-            "code=a&error=x&state=expected",
-            "code=&state=expected",
-        ] {
-            assert!(parse_callback(&request(1234, query), 1234, "expected").is_none());
-        }
-        assert!(
-            parse_callback(&request(1234, "code=a&state=expected"), 4321, "expected").is_none()
-        );
-        assert!(matches!(
-            parse_callback(
-                &request(1234, "error=access_denied&state=expected"),
-                1234,
-                "expected"
-            ),
-            Some(Callback::Denied)
-        ));
-    }
-    #[test]
-    fn callback_timeout_and_cancellation_are_bounded() {
-        let (listener, port) = listener();
-        let begin = Instant::now();
-        assert!(wait_callback(
-            &listener,
-            port,
-            "state",
-            begin + Duration::from_millis(50),
-            || Ok(())
-        )
-        .unwrap_err()
-        .contains("timed out"));
-        assert!(begin.elapsed() < Duration::from_secs(1));
-        assert_eq!(
-            wait_callback(
-                &listener,
-                port,
-                "state",
-                Instant::now() + Duration::from_secs(10),
-                || Err(CANCELLED.into())
-            )
-            .unwrap_err(),
-            CANCELLED
-        );
-    }
-    #[test]
-    fn loopback_ignores_unrelated_callback_then_accepts_valid_one() {
-        let (listener, port) = listener();
-        let sender = thread::spawn(move || {
-            for query in ["code=wrong&state=forged", "code=right&state=expected"] {
-                let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                stream.write_all(request(port, query).as_bytes()).unwrap();
-                let mut reply = String::new();
-                stream.read_to_string(&mut reply).unwrap();
-                assert!(!reply.contains("expected"));
-            }
-        });
-        assert_eq!(
-            wait_callback(
-                &listener,
-                port,
-                "expected",
-                Instant::now() + Duration::from_secs(3),
-                || Ok(())
-            )
-            .unwrap(),
-            "right"
-        );
-        sender.join().unwrap();
-    }
-    #[test]
     fn offline_status_refresh_rotation_and_disconnect() {
         let (github, store, transport) = fixture();
         assert!(github.access_token().unwrap().is_none());
@@ -1877,18 +1812,16 @@ mod tests {
         assert_eq!(transport.refreshes.load(Ordering::SeqCst), 1);
     }
     #[test]
-    fn broker_or_storage_failure_never_returns_unpersisted_token() {
-        let (github, store, transport) = fixture();
-        store.save("client", &saved(1)).unwrap();
-        transport.fail.store(true, Ordering::SeqCst);
-        assert!(github.access_token().is_err());
-        transport.fail.store(false, Ordering::SeqCst);
-        store.fail_save.store(true, Ordering::SeqCst);
-        assert!(github.access_token().is_err());
-        assert_eq!(
-            store.load("client").unwrap().unwrap().access_token,
-            "old-access"
-        );
+    fn refresh_or_storage_failure_never_reuses_consumed_token() {
+        for network in [true, false] {
+            let (github, store, transport) = fixture();
+            store.save("client", &saved(1)).unwrap();
+            transport.fail.store(network, Ordering::SeqCst);
+            store.fail_save.store(!network, Ordering::SeqCst);
+            assert!(github.access_token().is_err());
+            assert!(store.load("client").unwrap().is_none());
+            assert!(github.access_token().unwrap().is_none());
+        }
     }
     #[test]
     fn refresh_expiry_requires_sign_in_and_token_errors_are_sanitized() {
@@ -1904,6 +1837,253 @@ mod tests {
         let error = response.into_saved("user".into(), 1).err().unwrap();
         assert!(!error.contains("secret"));
     }
+    #[test]
+    fn preflight_without_account_preserves_external_git_helpers() {
+        let (mut github, store, transport) = fixture();
+        assert_eq!(
+            github
+                .token_for_repository("https://github.com/owner/repo.git")
+                .unwrap(),
+            None
+        );
+        store.save("client", &saved(1)).unwrap();
+        github.config = Err("unconfigured".into());
+        assert_eq!(
+            github
+                .token_for_repository("https://github.com/owner/repo")
+                .unwrap(),
+            None
+        );
+        assert_eq!(transport.refreshes.load(Ordering::SeqCst), 0);
+        assert!(transport.paths.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn preflight_allows_private_repository_with_same_refreshed_token_before_git() {
+        let (github, store, transport) = fixture();
+        store.save("client", &saved(1)).unwrap();
+        // The caller only receives a Git credential after refresh and grant discovery.
+        let token = github
+            .token_for_repository("https://github.com/OWNER/REPO.git/")
+            .unwrap()
+            .unwrap();
+        assert_eq!(token, "new-access");
+        assert_eq!(transport.refreshes.load(Ordering::SeqCst), 1);
+        let tokens = transport.get_tokens.lock().unwrap();
+        assert!(!tokens.is_empty());
+        assert!(tokens.iter().all(|value| value == &token));
+        let paths = transport.paths.lock().unwrap();
+        assert!(paths
+            .iter()
+            .any(|path| path == "/user/installations/1/repositories?per_page=100&page=2"));
+        assert!(paths
+            .iter()
+            .all(|path| path.starts_with("/user/installations")));
+    }
+
+    #[test]
+    fn preflight_allows_unexpired_token_without_refresh() {
+        let (github, store, transport) = fixture();
+        store.save("client", &saved(now().unwrap() + 3600)).unwrap();
+        assert_eq!(
+            github
+                .token_for_repository("https://github.com/owner/repo")
+                .unwrap()
+                .as_deref(),
+            Some("old-access")
+        );
+        assert_eq!(transport.refreshes.load(Ordering::SeqCst), 0);
+        assert!(transport
+            .get_tokens
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|token| token == "old-access"));
+    }
+
+    #[test]
+    fn preflight_missing_repository_or_installation_requires_grant_not_public_access() {
+        for no_installations in [false, true] {
+            let (github, store, transport) = fixture();
+            store.save("client", &saved(now().unwrap() + 3600)).unwrap();
+            transport
+                .no_installations
+                .store(no_installations, Ordering::SeqCst);
+            let error = github
+                .token_for_repository("https://github.com/owner/public-but-not-granted")
+                .unwrap_err();
+            assert!(error.contains("repository permission is missing"));
+            assert!(error.contains("Install or configure"));
+            assert!(!error.contains("old-access"));
+            assert!(!error.contains("refresh failed"));
+            assert!(transport
+                .paths
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|path| path.starts_with("/user/installations")));
+        }
+    }
+
+    #[test]
+    fn preflight_auth_failure_stops_before_discovery_and_is_not_missing_permission() {
+        for expired_refresh in [false, true] {
+            let (github, store, transport) = fixture();
+            let mut token = saved(1);
+            if expired_refresh {
+                token.refresh_expires_at = Some(1);
+            } else {
+                transport.fail.store(true, Ordering::SeqCst);
+            }
+            store.save("client", &token).unwrap();
+            let error = github
+                .token_for_repository("https://github.com/owner/repo")
+                .unwrap_err();
+            assert!(error.contains("authentication or token refresh failed"));
+            if expired_refresh {
+                assert!(error.contains("authorization expired. Sign in again."));
+            } else {
+                assert!(error.contains("token service unavailable"));
+            }
+            assert!(!error.contains("permission is missing"));
+            assert!(!error.contains("old-access"));
+            assert!(!error.contains("old-refresh"));
+            assert!(transport.paths.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn preflight_discovery_failure_is_sanitized_and_not_a_missing_grant() {
+        let (github, store, transport) = fixture();
+        store.save("client", &saved(now().unwrap() + 3600)).unwrap();
+        transport.api_fail.store(true, Ordering::SeqCst);
+        let error = github
+            .token_for_repository("https://github.com/owner/repo")
+            .unwrap_err();
+        assert_eq!(error, "Could not verify GitHub installation repository access: GitHub API is unreachable or timed out.");
+        assert!(!error.contains("permission is missing"));
+        assert!(!error.contains("secret"));
+    }
+
+    #[test]
+    fn preflight_metadata_only_grants_stay_visible_but_require_contents_approval() {
+        for permissions in [
+            serde_json::json!({"metadata": "read"}),
+            serde_json::json!({}),
+            serde_json::json!({"contents": "none"}),
+            serde_json::json!({"contents": null}),
+            serde_json::json!({"contents": "untrusted-secret"}),
+            serde_json::Value::Null,
+        ] {
+            let (github, store, transport) = fixture();
+            store.save("client", &saved(1)).unwrap();
+            *transport.installations.lock().unwrap() = Some(serde_json::json!([
+                {"id": 1, "permissions": permissions},
+                {"id": 2, "permissions": permissions}
+            ]));
+            let error = github
+                .token_for_repository("https://github.com/owner/repo")
+                .unwrap_err();
+            assert!(error.contains("Contents read permission is missing"));
+            assert!(error.contains("installation owner"));
+            assert!(error.contains("approve"));
+            assert!(error.contains("Contents Read-only permission update"));
+            assert!(error.contains("reauthorize"));
+            assert!(!error.contains("secret"));
+            assert!(!error.contains("new-access"));
+            assert!(!error.contains("old-refresh"));
+            assert_eq!(transport.refreshes.load(Ordering::SeqCst), 1);
+            assert!(transport
+                .get_tokens
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|token| token == "new-access"));
+            let repositories = github.repositories().unwrap();
+            assert_eq!(repositories.len(), 1);
+            assert!(repositories[0].private);
+        }
+    }
+
+    #[test]
+    fn preflight_contents_read_or_write_allows_private_repository_after_refresh() {
+        for contents in ["read", "write"] {
+            let (github, store, transport) = fixture();
+            store.save("client", &saved(1)).unwrap();
+            // A later metadata-only duplicate must not erase the readable grant.
+            *transport.installations.lock().unwrap() = Some(serde_json::json!([
+                {"id": 1, "permissions": {"contents": contents}},
+                {"id": 2, "permissions": {"metadata": "read"}}
+            ]));
+            assert_eq!(
+                github
+                    .token_for_repository("https://github.com/owner/repo")
+                    .unwrap()
+                    .as_deref(),
+                Some("new-access")
+            );
+            assert_eq!(transport.refreshes.load(Ordering::SeqCst), 1);
+            let tokens = transport.get_tokens.lock().unwrap();
+            assert!(!tokens.is_empty());
+            assert!(tokens.iter().all(|token| token == "new-access"));
+        }
+    }
+
+    #[test]
+    fn preflight_preserves_keychain_unlock_guidance_without_discovery() {
+        let (github, store, transport) = fixture();
+        store.fail_load.store(true, Ordering::SeqCst);
+        let error = github
+            .token_for_repository("https://github.com/owner/repo")
+            .unwrap_err();
+        assert!(error.starts_with("GitHub authentication or token refresh failed:"));
+        assert!(error.contains("Unlock your keychain and retry."));
+        assert!(!error.contains("Sign in"));
+        assert!(transport.paths.lock().unwrap().is_empty());
+        assert_eq!(transport.refreshes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn preflight_rejects_unsafe_urls_before_credentials_or_network() {
+        let (github, store, transport) = fixture();
+        store.save("client", &saved(1)).unwrap();
+        for url in [
+            "http://github.com/owner/repo",
+            "git@github.com:owner/repo.git",
+            "https://github.com.evil.test/owner/repo",
+            "https://evil.test/owner/repo",
+            "https://secret@github.com/owner/repo",
+            "https://github.com:443/owner/repo",
+            "https://github.com/owner/repo?secret",
+            "https://github.com/owner/repo#secret",
+            "https://github.com/owner/repo/tree/main",
+            "https://github.com/owner",
+            "https://github.com//repo",
+            "https://github.com/owner/.git",
+            "https://github.com/owner/%72epo",
+            "https://github.com/owner/../repo",
+            "https://github.com/owner/./repo",
+            "https://github.com/owner/repo//",
+            "https://github.com/owner/repo\\other",
+            " https://github.com/owner/repo",
+            "https://github.com/owner/repo\n",
+            "https://github.com/-owner/repo",
+        ] {
+            let error = github.token_for_repository(url).unwrap_err();
+            assert!(
+                error.starts_with("Invalid GitHub repository URL"),
+                "{url:?}"
+            );
+            assert!(!error.contains("secret"));
+        }
+        assert_eq!(transport.refreshes.load(Ordering::SeqCst), 0);
+        assert!(transport.paths.lock().unwrap().is_empty());
+        assert_eq!(
+            repository_name("https://GITHUB.COM/Owner/my_repo.test.git").unwrap(),
+            "Owner/my_repo.test"
+        );
+    }
+
     #[test]
     fn repositories_page_and_deduplicate() {
         let (github, store, transport) = fixture();
@@ -1923,10 +2103,7 @@ mod tests {
         let (github, _, _) = fixture();
         let error = github
             .start(|url| {
-                let url = Url::parse(&url).unwrap();
-                let params: BTreeMap<_, _> = url.query_pairs().collect();
-                assert_eq!(params.get("code_challenge_method").unwrap(), "S256");
-                assert_eq!(params.get("state").unwrap().len(), 43);
+                notify_device(url)?;
                 assert!(github.start(|_| Ok(())).err().unwrap().contains("already"));
                 github.cancel()?;
                 Ok(())
@@ -1939,31 +2116,12 @@ mod tests {
             .start(|_| Err("secret browser error".into()))
             .err()
             .unwrap()
-            .contains("system browser"));
+            .contains("Cannot display"));
     }
     #[test]
     fn sign_in_roundtrip_persists_profile() {
         let (github, store, _) = fixture();
-        let status = github
-            .start(|url| {
-                let url = Url::parse(&url).unwrap();
-                let params: BTreeMap<_, _> = url.query_pairs().collect();
-                let redirect = Url::parse(params.get("redirect_uri").unwrap()).unwrap();
-                let port = redirect.port().unwrap();
-                let state = params.get("state").unwrap().to_string();
-                thread::spawn(move || {
-                    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-                    stream
-                        .write_all(
-                            request(port, &format!("code=test-code&state={state}")).as_bytes(),
-                        )
-                        .unwrap();
-                    let mut reply = String::new();
-                    let _ = stream.read_to_string(&mut reply);
-                });
-                Ok(())
-            })
-            .unwrap();
+        let status = github.start(notify_device).unwrap();
         assert!(status.connected);
         let expected = Avatar {
             content_type: "image/png".into(),
@@ -1975,46 +2133,23 @@ mod tests {
         assert_eq!(store.load("client").unwrap().unwrap().login, "octocat");
         assert_eq!(github.status().unwrap().avatar_url, status.avatar_url);
     }
-    fn callback_browser(url: String) -> Result<(), String> {
-        let url = Url::parse(&url).unwrap();
-        let params: BTreeMap<_, _> = url.query_pairs().collect();
-        let redirect = Url::parse(params.get("redirect_uri").unwrap()).unwrap();
-        let port = redirect.port().unwrap();
-        let state = params.get("state").unwrap().to_string();
-        thread::spawn(move || {
-            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream
-                .write_all(request(port, &format!("code=test-code&state={state}")).as_bytes())
-                .unwrap();
-            let mut reply = String::new();
-            let _ = stream.read_to_string(&mut reply);
-        });
-        Ok(())
-    }
-
     #[test]
     fn disconnect_during_exchange_cannot_resurrect_credentials() {
-        struct PausedBroker {
+        struct PausedExchange {
             inner: Arc<MockTransport>,
             entered: Arc<std::sync::Barrier>,
             resume: Arc<std::sync::Barrier>,
         }
-        impl Transport for PausedBroker {
+        impl Transport for PausedExchange {
+            fn device(&self, url: &Url, id: &str) -> Result<DeviceResponse, String> {
+                self.inner.device(url, id)
+            }
             fn avatar(&self, url: &Url) -> Result<Avatar, String> {
                 self.inner.avatar(url)
             }
             fn token(&self, url: &Url, fields: &[(&str, &str)]) -> Result<TokenResponse, String> {
-                assert!(fields.contains(&("grant_type", "authorization_code")));
-                assert!(fields
-                    .iter()
-                    .any(|(key, value)| *key == "code_verifier" && value.len() == 43));
-                assert!(fields
-                    .iter()
-                    .any(|(key, value)| *key == "redirect_uri"
-                        && value.starts_with("http://127.0.0.1:")));
+                assert!(fields.contains(&("grant_type", DEVICE_GRANT)));
+                assert!(fields.contains(&("device_code", "private-device-code")));
                 self.entered.wait();
                 self.resume.wait();
                 self.inner.token(url, fields)
@@ -2027,50 +2162,20 @@ mod tests {
         store.save("client", &saved(now().unwrap() + 3600)).unwrap();
         let entered = Arc::new(std::sync::Barrier::new(2));
         let resume = Arc::new(std::sync::Barrier::new(2));
-        github.transport = Box::new(PausedBroker {
+        github.transport = Box::new(PausedExchange {
             inner: transport,
             entered: entered.clone(),
             resume: resume.clone(),
         });
         let github = Arc::new(github);
         let worker = github.clone();
-        let sign_in = thread::spawn(move || worker.start(callback_browser));
+        let sign_in = thread::spawn(move || worker.start(notify_device));
         entered.wait();
         github.disconnect().unwrap();
         resume.wait();
         assert_eq!(sign_in.join().unwrap().err().unwrap(), CANCELLED);
         assert!(store.load("client").unwrap().is_none());
         assert!(!github.pending.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn incomplete_callback_does_not_block_cancellation() {
-        let (listener, port) = listener();
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        stream.write_all(b"GET /callback?").unwrap();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let signal = cancelled.clone();
-        let worker = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(50));
-            signal.store(true, Ordering::SeqCst);
-        });
-        let begin = Instant::now();
-        let result = wait_callback(
-            &listener,
-            port,
-            "state",
-            begin + Duration::from_secs(10),
-            || {
-                if cancelled.load(Ordering::SeqCst) {
-                    Err(CANCELLED.into())
-                } else {
-                    Ok(())
-                }
-            },
-        );
-        assert_eq!(result.unwrap_err(), CANCELLED);
-        assert!(begin.elapsed() < Duration::from_secs(1));
-        worker.join().unwrap();
     }
 
     #[test]
@@ -2127,7 +2232,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_broker_response_is_rejected_before_reading_body() {
+    fn oversized_token_response_is_rejected_before_reading_body() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -2156,7 +2261,7 @@ mod tests {
     }
 
     #[test]
-    fn real_http_broker_errors_and_redirects_do_not_leak_secrets() {
+    fn real_http_token_errors_and_redirects_do_not_leak_secrets() {
         for (status, body) in [
             ("500 Internal Server Error", "secret-token"),
             ("200 OK", "not-json-secret"),
@@ -2173,7 +2278,7 @@ mod tests {
                 let _ = stream.read(&mut request);
                 write!(stream,"HTTP/1.1 {status}\r\nContent-Length: {}\r\nLocation: http://127.0.0.1:1/leak\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
             });
-            // HTTP is allowed only for this directly injected test endpoint; Config rejects it in production.
+            // HTTP is allowed only for this directly injected test endpoint; production Config uses fixed HTTPS endpoints.
             let error = Http::new()
                 .token(
                     &Url::parse(&format!("http://{addr}/token")).unwrap(),
@@ -2185,5 +2290,419 @@ mod tests {
             assert!(!error.contains("127.0.0.1"));
             server.join().unwrap();
         }
+    }
+    // Local HTTP fixtures exercise the actual form encoder and response decoder. Only
+    // these tests inject HTTP endpoints; production URLs are fixed GitHub HTTPS URLs.
+    struct LocalServer {
+        base: String,
+        requests: Arc<Mutex<Vec<(Instant, String)>>>,
+        stop: Arc<AtomicBool>,
+        worker: Option<thread::JoinHandle<()>>,
+    }
+    impl LocalServer {
+        fn new(replies: Vec<(u16, serde_json::Value)>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let record = requests.clone();
+            let stopping = stop.clone();
+            let worker = thread::spawn(move || {
+                let mut replies: std::collections::VecDeque<_> = replies.into();
+                while !stopping.load(Ordering::SeqCst) {
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(value) => value,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(error) => panic!("mock accept: {error}"),
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut bytes = Vec::new();
+                    let mut chunk = [0; 4096];
+                    loop {
+                        let n = stream.read(&mut chunk).unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        bytes.extend_from_slice(&chunk[..n]);
+                        if let Some(end) = bytes.windows(4).position(|b| b == b"\r\n\r\n") {
+                            let header = String::from_utf8_lossy(&bytes[..end]);
+                            let length: usize = header
+                                .lines()
+                                .filter_map(|line| line.split_once(':'))
+                                .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                                .map(|(_, value)| value.trim().parse().unwrap())
+                                .unwrap_or(0);
+                            if bytes.len() >= end + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    record
+                        .lock()
+                        .unwrap()
+                        .push((Instant::now(), String::from_utf8(bytes).unwrap()));
+                    let (status, body) = replies
+                        .pop_front()
+                        .unwrap_or((500, serde_json::json!({"error":"unexpected request"})));
+                    let body = body.to_string();
+                    let _ = write!(stream, "HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                }
+            });
+            Self {
+                base,
+                requests,
+                stop,
+                worker: Some(worker),
+            }
+        }
+        fn count(&self) -> usize {
+            self.requests.lock().unwrap().len()
+        }
+    }
+    impl Drop for LocalServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            self.worker.take().unwrap().join().unwrap();
+        }
+    }
+    struct LocalTransport {
+        http: Http,
+        profile: Arc<MockTransport>,
+    }
+    impl Transport for LocalTransport {
+        fn device(&self, url: &Url, id: &str) -> Result<DeviceResponse, String> {
+            self.http.device(url, id)
+        }
+        fn token(&self, url: &Url, fields: &[(&str, &str)]) -> Result<TokenResponse, String> {
+            self.http.token(url, fields)
+        }
+        fn poll_token(
+            &self,
+            url: &Url,
+            fields: &[(&str, &str)],
+            remaining: Duration,
+        ) -> Result<TokenResponse, PollError> {
+            self.http.poll_token(url, fields, remaining)
+        }
+        fn get(&self, path: &str, token: &str) -> Result<serde_json::Value, String> {
+            self.profile.get(path, token)
+        }
+        fn avatar(&self, url: &Url) -> Result<Avatar, String> {
+            self.profile.avatar(url)
+        }
+    }
+    fn device_json() -> serde_json::Value {
+        serde_json::json!({
+            "device_code":"private-device-code", "user_code":"ABCD-EFGH",
+            "verification_uri":"https://github.com/login/device", "expires_in":60, "interval":1
+        })
+    }
+    fn local_fixture(server: &LocalServer) -> (Github, Arc<MemoryStore>, Arc<MockTransport>) {
+        let (mut github, store, profile) = fixture();
+        github.config = Ok(Config {
+            client_id: CLIENT_ID.into(),
+            device_url: Url::parse(&format!("{}/device", server.base)).unwrap(),
+            token_url: Url::parse(&format!("{}/token", server.base)).unwrap(),
+            app_slug: APP_SLUG.into(),
+        });
+        github.transport = Box::new(LocalTransport {
+            http: Http::new(),
+            profile: profile.clone(),
+        });
+        (github, store, profile)
+    }
+    #[test]
+    fn fixed_public_configuration_and_safe_notification() {
+        let config = Config::compiled().unwrap();
+        assert_eq!(config.client_id, CLIENT_ID);
+        assert_eq!(config.app_slug, "vellistry");
+        assert_eq!(
+            config.device_url.as_str(),
+            "https://github.com/login/device/code"
+        );
+        assert_eq!(
+            config.token_url.as_str(),
+            "https://github.com/login/oauth/access_token"
+        );
+        let mut value = device_json();
+        value.as_object_mut().unwrap().remove("interval");
+        let device: DeviceResponse = serde_json::from_value(value).unwrap();
+        let authorization = device.authorization().unwrap();
+        assert_eq!(authorization.interval, 5);
+        let public = serde_json::to_value(authorization.clone()).unwrap();
+        assert_eq!(public.as_object().unwrap().len(), 4);
+        assert!(public.get("device_code").is_none());
+        assert!(!public.to_string().contains("private-device-code"));
+        let (github, _, _) = fixture();
+        assert_eq!(
+            github.management_url().unwrap(),
+            "https://github.com/apps/vellistry/installations/new"
+        );
+    }
+    #[test]
+    fn device_response_validation_and_slow_down_are_bounded() {
+        for (key, bad) in [
+            ("device_code", serde_json::json!("")),
+            ("device_code", serde_json::json!("secret\n")),
+            ("user_code", serde_json::json!("<script>")),
+            (
+                "verification_uri",
+                serde_json::json!("https://evil.example/login/device"),
+            ),
+            (
+                "verification_uri",
+                serde_json::json!("http://github.com/login/device"),
+            ),
+            ("expires_in", serde_json::json!(0)),
+            ("expires_in", serde_json::json!(u64::MAX)),
+            ("interval", serde_json::json!(0)),
+            ("interval", serde_json::json!(u64::MAX)),
+        ] {
+            let mut value = device_json();
+            value[key] = bad;
+            let device: DeviceResponse = serde_json::from_value(value).unwrap();
+            assert!(device.authorization().is_err());
+        }
+        assert_eq!(slowed_interval(5, None).unwrap(), 10);
+        assert_eq!(slowed_interval(10, Some(2)).unwrap(), 15);
+        assert_eq!(slowed_interval(10, Some(30)).unwrap(), 30);
+        assert!(slowed_interval(5, Some(u64::MAX)).is_err());
+    }
+    #[test]
+    fn local_device_pending_transient_retry_and_success_use_direct_forms() {
+        let server = LocalServer::new(vec![
+            (200, device_json()),
+            (200, serde_json::json!({"error":"authorization_pending"})),
+            (503, serde_json::json!({"error":"private-secret"})),
+            (
+                200,
+                serde_json::json!({"access_token":"new-access", "token_type":"bearer"}),
+            ),
+        ]);
+        let (github, store, _) = local_fixture(&server);
+        let notified = Instant::now();
+        let status = github
+            .start(|authorization| {
+                assert_eq!(server.count(), 1);
+                notify_device(authorization)
+            })
+            .unwrap();
+        assert!(status.connected);
+        assert_eq!(
+            store.load(CLIENT_ID).unwrap().unwrap().access_token,
+            "new-access"
+        );
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[1].0.duration_since(notified) >= Duration::from_secs(1));
+        assert!(requests[2].0.duration_since(requests[1].0) >= Duration::from_secs(1));
+        assert!(requests[3].0.duration_since(requests[2].0) >= Duration::from_secs(2));
+        for (_, request) in requests.iter() {
+            let lower = request.to_ascii_lowercase();
+            assert!(lower.starts_with("post "));
+            assert!(lower.contains("content-type: application/x-www-form-urlencoded"));
+            assert!(lower.contains("accept: application/json"));
+            assert!(!lower.contains("client_secret"));
+            assert!(!lower.contains("authorization:"));
+            assert!(!lower.contains("scope="));
+            let body = request.split_once("\r\n\r\n").unwrap().1;
+            let url = Url::parse(&format!("https://example.test/?{body}")).unwrap();
+            let fields: BTreeMap<_, _> = url.query_pairs().collect();
+            assert_eq!(fields.get("client_id").unwrap(), CLIENT_ID);
+            if request.starts_with("POST /device ") {
+                assert_eq!(fields.len(), 1);
+            } else {
+                assert_eq!(fields.len(), 3);
+                assert_eq!(fields.get("device_code").unwrap(), "private-device-code");
+                assert_eq!(fields.get("grant_type").unwrap(), DEVICE_GRANT);
+            }
+        }
+    }
+    #[test]
+    fn local_terminal_device_errors_do_not_persist_or_fetch_profile() {
+        for (code, expected) in [
+            ("access_denied", "denied"),
+            ("expired_token", "expired"),
+            ("incorrect_device_code", "invalid"),
+            ("invalid_grant", "invalid"),
+            ("invalid_device_code", "invalid"),
+            ("secret-unknown-error", "rejected"),
+        ] {
+            let server = LocalServer::new(vec![
+                (200, device_json()),
+                (200, serde_json::json!({"error":code})),
+            ]);
+            let (github, store, profile) = local_fixture(&server);
+            let error = github.start(notify_device).err().unwrap();
+            assert!(error.contains(expected));
+            assert!(!error.contains("secret"));
+            assert!(store.load(CLIENT_ID).unwrap().is_none());
+            assert!(profile.paths.lock().unwrap().is_empty());
+            assert_eq!(server.count(), 2);
+            assert!(!github.pending.load(Ordering::SeqCst));
+        }
+    }
+    #[test]
+    fn local_expiry_and_notification_failure_never_poll() {
+        let mut device = device_json();
+        device["expires_in"] = serde_json::json!(1);
+        device["interval"] = serde_json::json!(2);
+        let server = LocalServer::new(vec![(200, device)]);
+        let (github, _, _) = local_fixture(&server);
+        assert_eq!(github.start(notify_device).err().unwrap(), EXPIRED);
+        assert_eq!(server.count(), 1);
+        let server = LocalServer::new(vec![(200, device_json())]);
+        let (github, _, _) = local_fixture(&server);
+        let error = github
+            .start(|_| Err("secret-channel-error".into()))
+            .err()
+            .unwrap();
+        assert!(error.contains("Cannot display"));
+        assert!(!error.contains("secret"));
+        assert_eq!(server.count(), 1);
+    }
+    #[test]
+    fn local_slow_down_wait_is_cancellable_without_further_requests() {
+        let server = LocalServer::new(vec![
+            (200, device_json()),
+            (200, serde_json::json!({"error":"slow_down", "interval":30})),
+        ]);
+        let (github, store, _) = local_fixture(&server);
+        let github = Arc::new(github);
+        let signer = github.clone();
+        let worker = thread::spawn(move || signer.start(notify_device));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while server.count() < 2 && Instant::now() < deadline {
+            thread::sleep(POLL);
+        }
+        assert_eq!(server.count(), 2);
+        // Allow the response to arrive and enter the long server-specified wait.
+        thread::sleep(Duration::from_millis(100));
+        let begin = Instant::now();
+        github.cancel().unwrap();
+        assert_eq!(worker.join().unwrap().err().unwrap(), CANCELLED);
+        assert!(begin.elapsed() < Duration::from_millis(500));
+        assert_eq!(server.count(), 2);
+        assert!(store.load(CLIENT_ID).unwrap().is_none());
+    }
+    #[test]
+    fn failed_rotation_cleanup_quarantines_until_disconnect() {
+        let (github, store, _, _) = blocked_fixture(false, false);
+        store.memory.save("client", &saved(1)).unwrap();
+        store.memory.fail_save.store(true, Ordering::SeqCst);
+        store.fail_delete.store(true, Ordering::SeqCst);
+        assert!(github.access_token().is_err());
+        assert!(github.access_token().unwrap_err().contains("cleaned up"));
+        assert!(github.status().err().unwrap().contains("cleaned up"));
+        store.fail_delete.store(false, Ordering::SeqCst);
+        github.disconnect().unwrap();
+        assert!(github.access_token().unwrap().is_none());
+    }
+    #[test]
+    fn local_slow_down_adds_five_and_remains_in_force_after_pending() {
+        let server = LocalServer::new(vec![
+            (200, device_json()),
+            (200, serde_json::json!({"error":"slow_down"})),
+            (200, serde_json::json!({"error":"authorization_pending"})),
+            (
+                200,
+                serde_json::json!({"access_token":"new-access", "token_type":"bearer"}),
+            ),
+        ]);
+        let (github, _, _) = local_fixture(&server);
+        assert!(github.start(notify_device).unwrap().connected);
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        for index in [2, 3] {
+            assert!(
+                requests[index].0.duration_since(requests[index - 1].0) >= Duration::from_secs(6)
+            );
+        }
+    }
+    #[test]
+    fn http_poll_classifies_transient_and_terminal_failures_without_secrets() {
+        for (status, transient) in [(429, true), (503, true), (403, false), (302, false)] {
+            let server =
+                LocalServer::new(vec![(status, serde_json::json!({"error":"secret-error"}))]);
+            let result = Http::new().poll_token(
+                &Url::parse(&server.base).unwrap(),
+                &[("device_code", "secret-device-code")],
+                Duration::from_secs(1),
+            );
+            match result {
+                Err(PollError::Transient) => assert!(transient),
+                Err(PollError::Fatal(error)) => {
+                    assert!(!transient);
+                    assert!(!error.contains("secret"));
+                }
+                Ok(_) => panic!("HTTP failure must not yield tokens"),
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        drop(listener);
+        assert!(matches!(
+            Http::new().poll_token(&endpoint, &[], Duration::from_secs(1)),
+            Err(PollError::Transient)
+        ));
+    }
+    #[test]
+    fn local_invalid_device_and_ambiguous_token_payloads_fail_closed() {
+        let server = LocalServer::new(vec![(
+            200,
+            serde_json::json!({"error":"secret-server-error"}),
+        )]);
+        let (github, _, profile) = local_fixture(&server);
+        let error = github
+            .start(|_| panic!("must not notify for invalid device response"))
+            .err()
+            .unwrap();
+        assert!(!error.contains("secret"));
+        assert_eq!(server.count(), 1);
+        assert!(profile.paths.lock().unwrap().is_empty());
+        for payload in [
+            serde_json::json!({"access_token":"secret", "error":"authorization_pending"}),
+            serde_json::json!({"access_token":"secret", "token_type":"basic"}),
+            serde_json::json!({"error":"slow_down", "interval":u64::MAX}),
+        ] {
+            let server = LocalServer::new(vec![(200, device_json()), (200, payload)]);
+            let (github, store, profile) = local_fixture(&server);
+            let error = github.start(notify_device).err().unwrap();
+            assert!(!error.contains("secret"));
+            assert_eq!(server.count(), 2);
+            assert!(store.load(CLIENT_ID).unwrap().is_none());
+            assert!(profile.paths.lock().unwrap().is_empty());
+        }
+    }
+    #[test]
+    fn refresh_lost_storage_reply_and_invalid_rotation_delete_stale_tokens() {
+        let (github, store, _, _) = blocked_fixture(false, false);
+        store.memory.save("client", &saved(1)).unwrap();
+        store.fail_after_save.store(true, Ordering::SeqCst);
+        assert!(github.access_token().is_err());
+        assert!(store.memory.load("client").unwrap().is_none());
+        assert!(github.access_token().unwrap().is_none());
+
+        let server = LocalServer::new(vec![(
+            200,
+            serde_json::json!({"access_token":"secret", "token_type":"basic"}),
+        )]);
+        let (github, store, _) = local_fixture(&server);
+        store.save(CLIENT_ID, &saved(1)).unwrap();
+        assert!(github.access_token().is_err());
+        assert!(store.load(CLIENT_ID).unwrap().is_none());
+        assert!(github.access_token().unwrap().is_none());
+        assert_eq!(server.count(), 1);
+        let requests = server.requests.lock().unwrap();
+        let body = requests[0].1.split_once("\r\n\r\n").unwrap().1;
+        assert!(body.contains("grant_type=refresh_token"));
+        assert!(body.contains("refresh_token=old-refresh"));
+        assert!(!body.contains("client_secret"));
     }
 }

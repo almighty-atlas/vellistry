@@ -118,9 +118,13 @@ pub enum Error {
     #[error("git failed: {0}")]
     Git(String),
     #[error(
-        "Git authentication failed; configure a trusted credential helper or load your SSH key"
+        "Git authentication failed; sign in to GitHub again in Vellistry and retry. Advanced alternatives: configure a trusted Git credential helper or use an SSH key"
     )]
     GitAuthentication,
+    #[error("Git credential helper could not start; check the application's executable and runtime libraries")]
+    GitCredentialHelperStart,
+    #[error("Git credential helper protocol or local IPC failed; retry the operation or restart the application")]
+    GitCredentialIpc,
     #[error("GitHub repository is unavailable; check the repository name, account access, and organization authorization (private repositories may appear not found)")]
     GitPermissionDenied,
     #[error(
@@ -128,7 +132,7 @@ pub enum Error {
     )]
     GitNetwork,
     #[error(
-        "SSH host verification failed; verify GitHub's host key outside Mdwell before retrying"
+        "SSH host verification failed; verify GitHub's host key outside Vellistry before retrying"
     )]
     GitSshHostVerification,
     #[error("checkout is dirty; sync refused")]
@@ -166,6 +170,8 @@ pub enum ErrorCode {
     InvalidGithubUrl,
     Git,
     GitAuthentication,
+    GitCredentialHelperStart,
+    GitCredentialIpc,
     GitPermissionDenied,
     GitNetwork,
     GitSshHostVerification,
@@ -188,6 +194,8 @@ impl Error {
             Self::InvalidGithubUrl(_) => ErrorCode::InvalidGithubUrl,
             Self::Git(_) => ErrorCode::Git,
             Self::GitAuthentication => ErrorCode::GitAuthentication,
+            Self::GitCredentialHelperStart => ErrorCode::GitCredentialHelperStart,
+            Self::GitCredentialIpc => ErrorCode::GitCredentialIpc,
             Self::GitPermissionDenied => ErrorCode::GitPermissionDenied,
             Self::GitNetwork => ErrorCode::GitNetwork,
             Self::GitSshHostVerification => ErrorCode::GitSshHostVerification,

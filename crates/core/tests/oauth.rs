@@ -1,6 +1,6 @@
 use mdwell_core::handle_git_credential_request;
 #[cfg(unix)]
-use mdwell_core::{Core, Error};
+use mdwell_core::{Core, Error, ErrorCode};
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::path::Path;
@@ -18,6 +18,10 @@ fn main() {
     }
     #[cfg(unix)]
     {
+        if std::env::args().nth(1).as_deref() == Some("--http-fixture") {
+            http_fixture();
+            return;
+        }
         if std::env::current_exe().unwrap().file_name().unwrap() == "git" {
             std::process::exit(fake_git());
         }
@@ -28,8 +32,81 @@ fn main() {
     }
     helper_protocol();
     #[cfg(unix)]
-    offline_core_fixture();
+    {
+        real_git_helper_protocol();
+        offline_core_fixture();
+    }
     println!("OAuth offline fixtures passed");
+}
+
+// Launched by scripts/test-git-http.py with real Git and an isolated trusted
+// proxy/CA configuration. The fake credential never comes from the environment.
+#[cfg(unix)]
+fn http_fixture() {
+    let root = std::path::PathBuf::from(std::env::args_os().nth(2).expect("fixture root"));
+    let mode = std::env::args().nth(3).expect("fixture mode");
+    let data = root.join(format!("data-{mode}"));
+    let core = Core::open(&data).unwrap();
+    let result = core.add_github_with_token("https://github.com/owner/repo", Some(TOKEN));
+    if mode != "success" {
+        let expected = match mode.as_str() {
+            "permission" => ErrorCode::GitPermissionDenied,
+            "authentication" => ErrorCode::GitAuthentication,
+            _ => panic!("unknown HTTP fixture mode"),
+        };
+        assert_eq!(result.unwrap_err().info().code, expected);
+        assert_no_token(&data);
+        return;
+    }
+    let workspace = result.unwrap();
+    assert!(core
+        .read_document(workspace.id, "README.md")
+        .unwrap()
+        .html
+        .contains("quokka"));
+    assert_eq!(core.search("quokka", Some(workspace.id)).unwrap().len(), 1);
+    drop(core);
+
+    // Advance the served repository so the reopened core must fetch and merge
+    // new content, not merely repeat a no-op advertisement request.
+    let source = root.join("source");
+    std::fs::write(
+        source.join("README.md"),
+        "# HTTPS fixture\n\nUpdated platypus.\n",
+    )
+    .unwrap();
+    real_git(&source, &["add", "README.md"]);
+    real_git(&source, &["commit", "--quiet", "-m", "advance fixture"]);
+    real_git(
+        &source,
+        &[
+            "push",
+            "--quiet",
+            "--",
+            root.join("repositories/owner/repo.git").to_str().unwrap(),
+            "main",
+        ],
+    );
+
+    let core = Core::open(&data).unwrap();
+    assert_eq!(core.list_workspaces().unwrap().len(), 1);
+    core.sync_workspace_with_token(workspace.id, Some(TOKEN))
+        .unwrap();
+    assert!(core
+        .read_document(workspace.id, "README.md")
+        .unwrap()
+        .html
+        .contains("platypus"));
+    assert_eq!(
+        core.search("platypus", Some(workspace.id)).unwrap().len(),
+        1
+    );
+    assert!(core
+        .search("quokka", Some(workspace.id))
+        .unwrap()
+        .is_empty());
+    assert_no_token(&data);
+    println!("Real Git HTTPS clone/reopen/fetch/search passed");
 }
 
 fn helper(
@@ -61,6 +138,8 @@ fn helper_protocol() {
         b"protocol=https\nhost=github.com:443\n\n",
         b"protocol=https\nhost=github.com\nhost=evil.invalid\n\n",
         b"protocol=https\nhost=github.com\nusername=other\n\n",
+        b"capability[]=authtype\nprotocol=https\nhost=evil.invalid\n\n",
+        b"capability[]=state\nprotocol=https\nhost=github.com:443\n\n",
     ] {
         let output = helper(request, "get", &endpoint, &capability);
         assert!(output.status.success());
@@ -72,19 +151,26 @@ fn helper_protocol() {
         assert!(output.stdout.is_empty() && output.stderr.is_empty());
     }
     let output = helper(b"", "unexpected", &endpoint, &capability);
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty() && output.stderr.is_empty());
+    assert_helper_ipc_failure(&output);
     let output = helper(
         b"protocol=https\nhost=github.com\n\n",
         "get",
         "192.0.2.1:1",
         &capability,
     );
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty() && output.stderr.is_empty());
+    assert_helper_ipc_failure(&output);
     let output = helper(&vec![b'x'; 16 * 1024 + 1], "get", &endpoint, &capability);
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty() && output.stderr.is_empty());
+    assert_helper_ipc_failure(&output);
+    let unavailable = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let unavailable_endpoint = unavailable.local_addr().unwrap().to_string();
+    drop(unavailable);
+    let output = helper(
+        b"protocol=https\nhost=github.com\n",
+        "get",
+        &unavailable_endpoint,
+        &capability,
+    );
+    assert_helper_ipc_failure(&output);
     listener.set_nonblocking(true).unwrap();
     assert_eq!(
         listener.accept().unwrap_err().kind(),
@@ -105,7 +191,7 @@ fn helper_protocol() {
         }
         assert_eq!(
             request,
-            format!("{expected}\nprotocol=https\nhost=github.com\npath=owner/repo.git\n\n")
+            format!("{expected}\ncapability[]=authtype\ncapability[]=state\nprotocol=https\nhost=github.com\npath=owner/repo.git\n\n")
                 .as_bytes()
         );
         stream
@@ -113,7 +199,7 @@ fn helper_protocol() {
             .unwrap();
     });
     let output = helper(
-        b"protocol=https\nhost=github.com\npath=owner/repo.git\n\n",
+        b"capability[]=authtype\ncapability[]=state\nprotocol=https\nhost=github.com\npath=owner/repo.git\n",
         "get",
         &endpoint,
         &capability,
@@ -125,6 +211,92 @@ fn helper_protocol() {
         format!("username=x-access-token\npassword={TOKEN}\n\n").as_bytes()
     );
     assert!(output.stderr.is_empty());
+}
+
+fn assert_helper_ipc_failure(output: &std::process::Output) {
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        output.stderr,
+        b"mdwell: credential helper protocol or IPC failed\n"
+    );
+}
+
+// Verify real Git's EOF-terminated helper input and HTTP challenge on the IPC wire.
+#[cfg(unix)]
+fn real_git_helper_protocol() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = listener.local_addr().unwrap().to_string();
+    let capability = "ab".repeat(32);
+    let expected = capability.clone();
+    let server = std::thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "helper did not connect"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut byte = [0];
+        while !request.ends_with(b"\n\n") {
+            stream.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+            assert!(request.len() <= 16 * 1024);
+        }
+        assert_eq!(request, format!("{expected}\nprotocol=https\nhost=github.com\nusername=x-access-token\nwwwauth[]=Basic realm=GitHub\n\n").as_bytes());
+        stream
+            .write_all(format!("username=x-access-token\npassword={TOKEN}\n\n").as_bytes())
+            .unwrap();
+    });
+    let executable = std::env::current_exe().unwrap();
+    let helper = format!(
+        "credential.helper=!exec '{}' --mdwell-git-credential",
+        executable.to_str().unwrap().replace('\'', "'\\''")
+    );
+    let mut child = Command::new("git")
+        .args([
+            "-c",
+            "credential.helper=",
+            "-c",
+            &helper,
+            "-c",
+            "credential.username=x-access-token",
+            "credential",
+            "fill",
+        ])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("MDWELL_GIT_CREDENTIAL_ENDPOINT", endpoint)
+        .env("MDWELL_GIT_CREDENTIAL_CAPABILITY", capability)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"protocol=https\nhost=github.com\nwwwauth[]=Basic realm=GitHub\n\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    server.join().unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert!(String::from_utf8_lossy(&output.stdout).contains(&format!("password={TOKEN}\n")));
 }
 
 #[cfg(unix)]
@@ -249,6 +421,25 @@ fn core_fixture() {
     ));
     assert!(!marker.exists());
     std::env::remove_var("MDWELL_FIXTURE_REJECT");
+    for (mode, code) in [
+        ("not-called", ErrorCode::GitCredentialIpc),
+        ("unsupported", ErrorCode::GitCredentialIpc),
+        ("permission", ErrorCode::GitPermissionDenied),
+        ("network", ErrorCode::GitNetwork),
+        ("helper-start", ErrorCode::GitCredentialHelperStart),
+    ] {
+        std::env::set_var("MDWELL_FIXTURE_UNDELIVERED", mode);
+        let error = core
+            .add_github_with_token("https://github.com/owner/undelivered", Some(TOKEN))
+            .unwrap_err();
+        assert_eq!(error.info().code, code, "clone: {mode}");
+        let error = core
+            .sync_workspace_with_token(workspace.id, Some(TOKEN))
+            .unwrap_err();
+        assert_eq!(error.info().code, code, "fetch: {mode}");
+        assert!(!marker.exists());
+    }
+    std::env::remove_var("MDWELL_FIXTURE_UNDELIVERED");
     for token in ["", "bad\npassword=injected", "bad\rtoken", "bad\0token"] {
         let error = core
             .add_github_with_token("https://github.com/owner/invalid", Some(token))
@@ -324,6 +515,26 @@ fn fake_git() -> i32 {
         child.stdin.take().unwrap().write_all(input).unwrap();
         child.wait_with_output().unwrap()
     };
+    if let Ok(mode) = std::env::var("MDWELL_FIXTURE_UNDELIVERED") {
+        if mode == "unsupported" {
+            let output = credential(
+                "fill",
+                b"protocol=https\nhost=github.com\nusername=unsupported\n\n",
+            );
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+        }
+        eprintln!(
+            "{}",
+            match mode.as_str() {
+                "permission" => "fatal: requested URL returned error: 403",
+                "network" => "fatal: SSL certificate problem: untrusted issuer",
+                "helper-start" => "mdwell: credential helper execution failed",
+                _ => "fatal: requested URL returned error: 401; Authentication failed",
+            }
+        );
+        return 1;
+    }
     let url = &args[args.len() - 2];
     if url.starts_with("git@github.com:") {
         assert!(std::env::var_os("MDWELL_GIT_CREDENTIAL_ENDPOINT").is_none());
@@ -357,7 +568,7 @@ fn fake_git() -> i32 {
         assert!(String::from_utf8_lossy(&output.stdout).contains(&format!("password={expected}\n")));
         if std::env::var_os("MDWELL_FIXTURE_REJECT").is_some() {
             assert!(credential("reject", &output.stdout).status.success());
-            eprintln!("fatal: Authentication failed");
+            eprintln!("fatal: requested URL returned error: 401; Authentication failed");
             return 1;
         }
         assert!(credential("approve", &output.stdout).status.success());

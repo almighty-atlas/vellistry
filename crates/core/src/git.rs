@@ -7,9 +7,11 @@ const HELPER_FLAG: &str = "--mdwell-git-credential";
 const ENDPOINT_ENV: &str = "MDWELL_GIT_CREDENTIAL_ENDPOINT";
 const CAPABILITY_ENV: &str = "MDWELL_GIT_CREDENTIAL_CAPABILITY";
 const CREDENTIAL_LIMIT: usize = 16 * 1024;
+const HELPER_START_FAILURE: &str = "mdwell: credential helper execution failed";
+const HELPER_IPC_FAILURE: &str = "mdwell: credential helper protocol or IPC failed";
 
 fn credential_error() -> Error {
-    Error::Git("OAuth credential helper failed".into())
+    Error::GitCredentialIpc
 }
 
 /// Dispatch this before initializing the application, logging, or parsing normal
@@ -18,6 +20,16 @@ fn credential_error() -> Error {
 /// the same executable as `--mdwell-git-credential get|store|erase`. Store/erase
 /// are deliberately no-ops: OAuth credentials never reach a persistent helper.
 pub fn handle_git_credential_request() -> Result<bool> {
+    let result = dispatch_git_credential_request();
+    if result.is_err() {
+        // A fixed marker distinguishes a running helper's protocol/IPC failure
+        // from a loader/startup failure. Never print the underlying error or input.
+        eprintln!("{HELPER_IPC_FAILURE}");
+    }
+    result
+}
+
+fn dispatch_git_credential_request() -> Result<bool> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.first().is_none_or(|arg| arg != HELPER_FLAG) {
         return Ok(false);
@@ -112,9 +124,10 @@ fn github_credential_request(request: &[u8]) -> bool {
         match key {
             "protocol" if protocol.is_none() => protocol = Some(value),
             "host" if host.is_none() => host = Some(value),
-            // HTTP authentication challenges are opaque data, not routing policy.
-            // Modern Git forwards one or more WWW-Authenticate headers to helpers.
-            "path" | "wwwauth[]" => {}
+            // Challenges and capability announcements are not routing policy.
+            // Modern Git's HTTP transport advertises capabilities even when
+            // credential fill does not. Ignore them without opting into any.
+            "path" | "wwwauth[]" | "capability[]" => {}
             "username" if value == "x-access-token" => {}
             _ => return false,
         }
@@ -154,12 +167,13 @@ fn credential_frame(stream: &mut std::net::TcpStream) -> std::io::Result<Vec<u8>
 
 struct CredentialBroker {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    delivered: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl CredentialBroker {
     fn attach(command: &mut Command, token: &str) -> Result<Self> {
-        let executable = std::env::current_exe().map_err(|_| credential_error())?;
+        let executable = std::env::current_exe().map_err(|_| Error::GitCredentialHelperStart)?;
         Self::attach_executable(command, token, &executable)
     }
 
@@ -169,9 +183,9 @@ impl CredentialBroker {
             atomic::{AtomicBool, Ordering},
             Arc,
         };
-        let executable = executable.to_str().ok_or_else(credential_error)?;
+        let executable = executable.to_str().ok_or(Error::GitCredentialHelperStart)?;
         if executable.chars().any(char::is_control) {
-            return Err(credential_error());
+            return Err(Error::GitCredentialHelperStart);
         }
         // Git shell helpers use its POSIX shell, including Git for Windows. Quote
         // the executable as a single word; never interpolate the token in shell text.
@@ -180,8 +194,11 @@ impl CredentialBroker {
         } else {
             executable.to_owned()
         };
+        // Keep a shell around the re-exec so loader/startup failures produce a
+        // stable marker rather than looking like an HTTP credential rejection.
+        // Git appends get/store/erase; forward it without evaluating shell data.
         let helper = format!(
-            "!exec '{}' {HELPER_FLAG}",
+            "!f() {{ '{}' {HELPER_FLAG} \"$@\" || {{ printf '%s\\n' '{HELPER_START_FAILURE}' >&2; return 1; }}; }}; f",
             executable.replace('\'', "'\\''")
         );
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -206,6 +223,8 @@ impl CredentialBroker {
             ]);
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
+        let delivered = Arc::new(AtomicBool::new(false));
+        let delivery = delivered.clone();
         let token = token.to_owned();
         let thread = std::thread::Builder::new()
             .name("mdwell-git-credential".into())
@@ -221,13 +240,16 @@ impl CredentialBroker {
                                     if key == capability.as_bytes()
                                         && github_credential_request(request)
                                         && !stopped.load(Ordering::Acquire)
-                                    {
-                                        let _ = stream.write_all(
-                                            format!(
-                                                "username=x-access-token\npassword={token}\n\n"
+                                        && stream
+                                            .write_all(
+                                                format!(
+                                                    "username=x-access-token\npassword={token}\n\n"
+                                                )
+                                                .as_bytes(),
                                             )
-                                            .as_bytes(),
-                                        );
+                                            .is_ok()
+                                    {
+                                        delivery.store(true, Ordering::Release);
                                     }
                                 }
                             }
@@ -242,8 +264,17 @@ impl CredentialBroker {
             .map_err(|_| credential_error())?;
         Ok(Self {
             stop,
+            delivered,
             thread: Some(thread),
         })
+    }
+
+    fn finish(self) -> bool {
+        let delivered = self.delivered.clone();
+        // Join the broker before reading delivery state: a completed Git child
+        // must not race a successful response write that is still being recorded.
+        drop(self);
+        delivered.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -380,15 +411,23 @@ fn run_with_oauth_settings(
     token: Option<&str>,
 ) -> Result<String> {
     let (mut command, _settings) = authenticated_command(root, allow_file, trusted)?;
-    let _broker = token
+    let broker = token
         .filter(|_| matches!(args.first().copied(), Some("clone" | "fetch")))
         .map(|token| CredentialBroker::attach(&mut command, token))
         .transpose()?;
     command.args(args);
     let operation = operation(args);
     let (success, output, stderr) = command_output(command, Duration::from_secs(120), operation)?;
+    let delivered = broker.map(CredentialBroker::finish);
     if !success {
-        return Err(classify_error(&String::from_utf8_lossy(&stderr), operation));
+        let error = classify_error(&String::from_utf8_lossy(&stderr), operation);
+        return Err(
+            if matches!(error, Error::GitAuthentication) && delivered == Some(false) {
+                Error::GitCredentialIpc
+            } else {
+                error
+            },
+        );
     }
     String::from_utf8(output)
         .map_err(|_| Error::Git(format!("git {operation} returned non-UTF-8 output")))
@@ -610,7 +649,7 @@ fn check_local_config(root: &Path) -> Result<()> {
             "could not inspect repository Git configuration".into(),
         ));
     }
-    for (key, _) in parse_config(&output)? {
+    for (key, value) in parse_config(&output)? {
         let key = key.to_ascii_lowercase();
         let allowed = matches!(
             key.as_str(),
@@ -625,6 +664,8 @@ fn check_local_config(root: &Path) -> Result<()> {
                 | "user.name"
                 | "user.email"
         ) || matches!(key.as_str(), "remote.origin.url" | "remote.origin.fetch")
+            // Git persists this data-only setting for our own --no-tags clone.
+            || (key == "remote.origin.tagopt" && value == "--no-tags")
             || (key.starts_with("branch.")
                 && (key.ends_with(".remote") || key.ends_with(".merge")));
         if !allowed {
@@ -735,7 +776,17 @@ fn operation(args: &[&str]) -> &'static str {
 
 fn classify_error(stderr: &str, operation: &str) -> Error {
     let text = stderr.to_ascii_lowercase();
-    if [
+    if text
+        .lines()
+        .any(|line| line.eq_ignore_ascii_case(HELPER_IPC_FAILURE))
+    {
+        Error::GitCredentialIpc
+    } else if text
+        .lines()
+        .any(|line| line.eq_ignore_ascii_case(HELPER_START_FAILURE))
+    {
+        Error::GitCredentialHelperStart
+    } else if [
         "host key verification failed",
         "remote host identification has changed",
         "no matching host key",
@@ -779,6 +830,10 @@ fn classify_error(stderr: &str, operation: &str) -> Error {
         "network is unreachable",
         "could not read from remote repository",
         "ssl certificate problem",
+        "server certificate verification failed",
+        "ssl connect error",
+        "tls connect error",
+        "gnutls_handshake",
         "connection reset",
         "operation timed out",
     ]
@@ -899,6 +954,41 @@ mod tests {
             .success());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn real_git_helper_start_failure_is_not_authentication_rejection() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        // An existing executable whose runtime interpreter is unavailable models a
+        // desktop binary that cannot be re-executed in Git's runtime environment.
+        let host = temp.path().join("host");
+        fs::write(&host, "#!/mdwell-fixture-missing-interpreter\n").unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let (mut command, _settings) = authenticated_command(temp.path(), false, &[]).unwrap();
+        let _broker =
+            CredentialBroker::attach_executable(&mut command, "fixture-secret", &host).unwrap();
+        command.args(["credential", "fill"]);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        std::io::Write::write_all(
+            &mut child.stdin.take().unwrap(),
+            b"protocol=https\nhost=github.com\nwwwauth[]=Basic realm=GitHub\n\n",
+        )
+        .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success());
+        assert_eq!(
+            classify_error(&String::from_utf8_lossy(&output.stderr), "clone")
+                .info()
+                .code,
+            crate::ErrorCode::GitCredentialHelperStart,
+            "helper runtime failure must not be reported as rejected credentials"
+        );
+    }
+
     #[test]
     fn oauth_brokers_are_scoped_authenticated_bounded_and_ephemeral() {
         use std::io::{Read, Write};
@@ -947,10 +1037,12 @@ mod tests {
         ] {
             assert!(request(capability, input).is_empty());
         }
+        assert!(!broker.delivered.load(std::sync::atomic::Ordering::Acquire));
         assert_eq!(
             request(capability, "protocol=https\nhost=github.com"),
             format!("username=x-access-token\npassword={token}\n\n")
         );
+        assert!(broker.delivered.load(std::sync::atomic::Ordering::Acquire));
         let (mut other, _settings) = authenticated_command(temp.path(), false, &[]).unwrap();
         let other_broker = CredentialBroker::attach(&mut other, "different-token").unwrap();
         let other_env: std::collections::HashMap<_, _> = other.get_envs().collect();
@@ -1287,6 +1379,9 @@ mod tests {
         use crate::ErrorCode;
         for (text, code) in [
             ("Authentication failed", ErrorCode::GitAuthentication),
+            (HELPER_START_FAILURE, ErrorCode::GitCredentialHelperStart),
+            (HELPER_IPC_FAILURE, ErrorCode::GitCredentialIpc),
+            ("mdwell: credential helper protocol or IPC failed\nmdwell: credential helper execution failed\nfatal: could not read password", ErrorCode::GitCredentialIpc),
             (
                 "fatal: unable to get password from user",
                 ErrorCode::GitAuthentication,
@@ -1305,6 +1400,12 @@ mod tests {
                 ErrorCode::GitPermissionDenied,
             ),
             ("Could not resolve host", ErrorCode::GitNetwork),
+            ("SSL certificate problem: unable to get local issuer certificate", ErrorCode::GitNetwork),
+            ("server certificate verification failed", ErrorCode::GitNetwork),
+            ("gnutls_handshake() failed", ErrorCode::GitNetwork),
+            ("SSL connect error", ErrorCode::GitNetwork),
+            ("TLS connect error", ErrorCode::GitNetwork),
+            ("requested URL returned error: 401", ErrorCode::GitAuthentication),
             (
                 "Host key verification failed",
                 ErrorCode::GitSshHostVerification,
@@ -1375,6 +1476,41 @@ mod tests {
         ] {
             assert!(validate_url(url).is_err(), "{url}");
         }
+    }
+
+    #[test]
+    fn real_clone_no_tags_configuration_is_safe_for_sync() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fixture_git(&source, &["init", "-b", "main"]);
+        fs::write(source.join("README.md"), "# Fixture\n").unwrap();
+        fixture_git(&source, &["add", "."]);
+        fixture_git(&source, &["commit", "-m", "fixture"]);
+        let checkout = temp.path().join("checkout");
+        let url = format!("file://{}", source.display());
+        run_with_protocol(
+            temp.path(),
+            &[
+                "clone",
+                "--quiet",
+                "--depth=1",
+                "--single-branch",
+                "--no-tags",
+                "--",
+                &url,
+                checkout.to_str().unwrap(),
+            ],
+            true,
+        )
+        .unwrap();
+        assert!(
+            check_local_config(&checkout).is_ok(),
+            "core must accept configuration produced by its own clone flags"
+        );
+        sync_with_protocol(&checkout, &url, true).unwrap();
+        fixture_git(&checkout, &["config", "remote.origin.tagopt", "unexpected"]);
+        assert!(check_local_config(&checkout).is_err());
     }
 
     #[test]

@@ -1,12 +1,16 @@
-import { invoke } from '@tauri-apps/api/core';
-import type { Workspace, DocumentSummary, Document, SearchHit, RefreshReport, ResolvedLink, Asset, GithubStatus, GithubRepository } from './types';
+import { Channel, invoke } from '@tauri-apps/api/core';
+import type { Workspace, DocumentSummary, Document, SearchHit, RefreshReport, ResolvedLink, Asset, DeviceAuthorization, GithubStatus, GithubRepository } from './types';
 
 export const api = {
   workspaces: () => invoke<Workspace[]>('list_workspaces', {}),
   addLocal: (path: string) => invoke<Workspace>('add_local', { path }),
-  addGithub: (url: string) => invoke<Workspace>('add_github', { url }),
+  addGithub: (url: string, nativeAccount = false) => invoke<Workspace>('add_github', nativeAccount ? { url, nativeAccount: true } : { url }),
   githubStatus: () => invoke<GithubStatus>('github_status', {}),
-  githubConnect: () => invoke<GithubStatus>('github_connect', {}),
+  githubConnect: (onDevice: (authorization: DeviceAuthorization) => void) => {
+    const channel = new Channel<DeviceAuthorization>();
+    channel.onmessage = onDevice;
+    return invoke<GithubStatus>('github_connect', { onDevice: channel });
+  },
   githubCancel: () => invoke<void>('github_cancel', {}),
   githubDisconnect: () => invoke<void>('github_disconnect', {}),
   githubRepositories: () => invoke<GithubRepository[]>('github_repositories', {}),

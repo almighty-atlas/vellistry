@@ -255,6 +255,8 @@
   }
   async function githubAdded(w: Workspace) {
     await loadWorkspaces(); closeModal(); githubUrl = ''; notify(`Added ${w.name}`);
+    const first = documents[w.id]?.[0];
+    if (first) await navigate({ workspace_id: w.id, path: first.path });
   }
   async function addGithub(event: SubmitEvent) {
     event.preventDefault(); if (busy) return;
@@ -459,7 +461,7 @@
 <div class="app" class:sidebar-hidden={!preferences.sidebar} style:--reading-size={`${preferences.size}px`} class:sans={preferences.font === 'sans'}>
   {#if preferences.sidebar}
     <aside class="sidebar" aria-label="Workspaces">
-      <div class="brand"><span class="brand-mark" aria-hidden="true">m.</span><strong>mdwell</strong><button class="icon-button" aria-label="Hide sidebar" onclick={() => preferences.sidebar = false}>⇤</button></div>
+      <div class="brand"><span class="brand-mark" aria-hidden="true">v.</span><strong>Vellistry</strong><button class="icon-button" aria-label="Hide sidebar" onclick={() => preferences.sidebar = false}>⇤</button></div>
       <button class="search-launch" onclick={() => showModal('search')}><span>⌕ &nbsp; Search your library</span><kbd>Ctrl ⇧ F</kbd></button>
       <div class="sidebar-label">WORKSPACES <button class="icon-button" aria-label="Add workspace" onclick={() => showModal('commands')}>＋</button></div>
       <nav class="workspace-list" aria-label="Document library">
@@ -527,7 +529,9 @@
     </div><div class="palette-footer">↑ ↓ navigate <span>↵ select · Esc close</span></div>
   {:else if modal === 'github'}
     <div class="settings"><GithubAccount picker onadded={githubAdded} /></div>
-    <form onsubmit={addGithub}><p>Clone a public or private repository using HTTPS or SSH. Import and Sync contact GitHub only when you request them.</p><label for="github-url">Repository URL</label><input id="github-url" type="text" required placeholder="https://github.com/owner/repository or git@github.com:owner/repository.git" bind:value={githubUrl} /><p class="muted">SSH uses your ssh-agent and verified known_hosts. HTTPS uses your Git credential helper: gh auth login then gh auth setup-git, or Git Credential Manager. Account authorization is handled by the native app, not this form. Never paste tokens into a URL; this URL draft is not saved.</p><button type="button" onclick={() => { void openUrl(gitGuides.ssh).catch(e => { error = errorMessage(e); }); }}>SSH setup guide ↗</button><button type="button" onclick={() => { void openUrl(gitGuides.https).catch(e => { error = errorMessage(e); }); }}>HTTPS setup guide ↗</button><button type="button" onclick={() => { void openUrl(gitGuides.fingerprints).catch(e => { error = errorMessage(e); }); }}>Verify SSH fingerprints ↗</button><button type="button" onclick={() => { void openUrl(gitGuides.gcm).catch(e => { error = errorMessage(e); }); }}>Git Credential Manager ↗</button>{#if error}<p role="alert" class="error-text">{error}</p>{/if}<button class="primary" disabled={busy}>{busy ? 'Cloning repository…' : 'Add repository'}</button></form>
+    <details><summary>Erweiterte Optionen</summary>
+    <form onsubmit={addGithub}><p>Clone a public or private repository using HTTPS or SSH. Import and Sync contact GitHub only when you request them.</p><label for="github-url">Repository URL</label><input id="github-url" type="text" required placeholder="https://github.com/owner/repository or git@github.com:owner/repository.git" bind:value={githubUrl} /><p class="muted">SSH uses your ssh-agent and verified known_hosts. HTTPS uses your Git credential helper: gh auth login then gh auth setup-git, or Git Credential Manager. Account authorization is handled by the native app, not this form. Never paste tokens into a URL; this URL draft is not saved.</p><button type="button" onclick={() => { void openUrl(gitGuides.ssh).catch(e => { error = errorMessage(e); }); }}>SSH setup guide ↗</button><button type="button" onclick={() => { void openUrl(gitGuides.https).catch(e => { error = errorMessage(e); }); }}>HTTPS setup guide ↗</button><button type="button" onclick={() => { void openUrl(gitGuides.fingerprints).catch(e => { error = errorMessage(e); }); }}>Verify SSH fingerprints ↗</button><button type="button" onclick={() => { void openUrl(gitGuides.gcm).catch(e => { error = errorMessage(e); }); }}>Git Credential Manager ↗</button>{#if error}<p role="alert" class="error-text">{error}</p>{/if}<button class="primary" disabled={busy}>{busy ? 'Cloning and indexing repository…' : 'Add repository'}</button></form>
+        </details>
   {:else if modal === 'toc' && current}
     <nav class="palette-results" aria-label="Document headings">{#each current.toc as heading}<button style:padding-left={`${14 + Math.max(0, heading.level - 1) * 12}px`} onclick={() => { closeModal(); jump({ ...current!, fragment: heading.id }); }}>{heading.text}</button>{/each}</nav>
   {:else if modal === 'asset'}

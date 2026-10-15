@@ -25,6 +25,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo test -p mdwell-core
+      - name: Test authenticated smart HTTPS clone and fetch offline
+        run: python3 scripts/test-git-http.py
 
   frontend:
     name: Frontend checks, tests and build
@@ -68,3 +70,8 @@ jobs:
         run: cargo check --manifest-path src-tauri/Cargo.toml
       - name: Build desktop host (unsigned, no installer bundling)
         run: cargo build --manifest-path src-tauri/Cargo.toml
+      - name: Test Linux development and release credential helpers
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --manifest-path src-tauri/Cargo.toml --release --offline
+          python3 scripts/test-git-helper.py target/debug/mdwell-desktop target/release/mdwell-desktop

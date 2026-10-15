@@ -169,18 +169,48 @@ describe('reading UI', () => {
   it('offers connected accounts in settings and adds a private repository from the GitHub picker', async () => {
     vi.mocked(api.githubStatus).mockResolvedValue({ configured: true, connected: true, login: 'reader', avatar_url: null });
     vi.mocked(api.githubRepositories).mockResolvedValue([{ id: 4, full_name: 'reader/private-notes', private: true, clone_url: 'https://github.com/reader/private-notes.git' }]);
-    vi.mocked(api.addGithub).mockResolvedValue({ id: 4, name: 'private-notes', kind: 'github', root: '/repo', url: 'https://github.com/reader/private-notes.git' });
+    const workspace = { id: 4, name: 'private-notes', kind: 'github' as const, root: '/repo', url: 'https://github.com/reader/private-notes.git' };
+    vi.mocked(api.addGithub).mockImplementation(async () => {
+      vi.mocked(api.workspaces).mockResolvedValue([{ id: 1, name: 'Notes', root: '/notes', kind: 'local', url: null }, workspace]);
+      return workspace;
+    });
+    const first = { ...doc, workspace_id: 4, path: 'README.md', title: 'Repository introduction', html: '<h1>Repository introduction</h1>' };
+    vi.mocked(api.documents).mockImplementation(async id => id === 4 ? [first, { ...other, workspace_id: 4 }] : [doc, other]);
+    vi.mocked(api.read).mockResolvedValue(first);
     render(App);
     await screen.findByRole('button', { name: /start\.md/ });
     await fireEvent.click(screen.getByRole('button', { name: /Reading preferences/ }));
     expect(screen.getByRole('heading', { name: 'Connected accounts' })).toBeTruthy();
     expect(await screen.findByText('Connected as reader')).toBeTruthy();
-    expect(screen.getByRole('button', { name: /Manage repositories/ })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Repository-Zugriff verwalten/ })).toBeTruthy();
     await fireEvent.click(screen.getByRole('button', { name: 'Close dialog' }));
     await fireEvent.click(screen.getByRole('button', { name: 'Add a GitHub repository' }));
+    expect(screen.getByText('Erweiterte Optionen').closest('details')!.open).toBe(false);
     await fireEvent.click(await screen.findByRole('button', { name: 'reader/private-notes Private' }));
-    await waitFor(() => expect(api.addGithub).toHaveBeenCalledWith('https://github.com/reader/private-notes.git'));
-    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Repository URL' })).toBeNull());
+    await waitFor(() => expect(api.addGithub).toHaveBeenCalledWith('https://github.com/reader/private-notes.git', true));
+    await screen.findByRole('heading', { name: 'Repository introduction' });
+    expect(api.documents).toHaveBeenCalledWith(4);
+    expect(api.read).toHaveBeenCalledWith(4, 'README.md');
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+  it('closes the picker without reading another workspace when the added repository has no documents', async () => {
+    vi.mocked(api.githubStatus).mockResolvedValue({ configured: true, connected: true, login: 'reader', avatar_url: null });
+    vi.mocked(api.githubRepositories).mockResolvedValue([{ id: 4, full_name: 'reader/empty', private: true, clone_url: 'https://github.com/reader/empty.git' }]);
+    const workspace = { id: 4, name: 'empty', kind: 'github' as const, root: '/repo', url: 'https://github.com/reader/empty.git' };
+    vi.mocked(api.addGithub).mockImplementation(async () => {
+      vi.mocked(api.workspaces).mockResolvedValue([workspace]);
+      vi.mocked(api.documents).mockResolvedValue([]);
+      return workspace;
+    });
+    render(App);
+    await screen.findByRole('button', { name: /start\.md/ });
+    await fireEvent.click(screen.getByRole('button', { name: 'Add a GitHub repository' }));
+    const advanced = screen.getByText('Erweiterte Optionen').closest('details')!;
+    expect(advanced.open).toBe(false);
+    await fireEvent.click(await screen.findByRole('button', { name: 'reader/empty Private' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(api.documents).toHaveBeenCalledWith(4);
+    expect(api.read).not.toHaveBeenCalled();
   });
   it('keeps unchanged polls from reading/rendering the current document', async () => {
     const interval = vi.spyOn(globalThis, 'setInterval');
@@ -200,6 +230,7 @@ describe('reading UI', () => {
     render(App);
     await screen.findByRole('button', { name: /start\.md/ });
     await fireEvent.click(screen.getByRole('button', { name: 'Add a GitHub repository' }));
+    await fireEvent.click(screen.getByText('Erweiterte Optionen'));
     const input = screen.getByRole('textbox', { name: 'Repository URL' }) as HTMLInputElement;
     expect(input.type).toBe('text');
     await fireEvent.input(input, { target: { value: url } });
@@ -216,6 +247,7 @@ describe('reading UI', () => {
     render(App);
     await screen.findByRole('button', { name: /start\.md/ });
     await fireEvent.click(screen.getByRole('button', { name: 'Add a GitHub repository' }));
+    await fireEvent.click(screen.getByText('Erweiterte Optionen'));
     expect(openUrl).not.toHaveBeenCalled();
     vi.mocked(api.addGithub).mockRejectedValue({ code, message: 'sanitized failure' });
     await fireEvent.input(screen.getByRole('textbox', { name: 'Repository URL' }), { target: { value: 'git@github.com:owner/repo.git' } });
@@ -323,6 +355,7 @@ describe('reading UI', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: 'Add a GitHub repository' }).hasAttribute('disabled')).toBe(false));
     vi.mocked(api.addGithub).mockResolvedValue({ ...workspace, kind: 'github', url: 'https://github.com/owner/repo' });
     await fireEvent.click(screen.getByRole('button', { name: 'Add a GitHub repository' }));
+    await fireEvent.click(screen.getByText('Erweiterte Optionen'));
     await fireEvent.input(screen.getByRole('textbox', { name: 'Repository URL' }), { target: { value: 'https://github.com/owner/repo' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Add repository' }));
     await waitFor(() => expect(api.addGithub).toHaveBeenCalledWith('https://github.com/owner/repo'));
